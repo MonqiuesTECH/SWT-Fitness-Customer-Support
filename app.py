@@ -1,38 +1,77 @@
 import os
 from io import BytesIO
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import streamlit as st
 
-# Lightweight text pipeline
+# Lightweight text pipeline (no paid APIs)
 from pypdf import PdfReader
 import joblib
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# --------- App config ----------
-st.set_page_config(page_title="SWT Fitness — AI Support", page_icon="💬", layout="centered")
+# ──────────────────────────────────────────────────────────────────────────────
+# App / constants
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💪", layout="centered")
 
 DATA_DIR = "data"
-PDF_PATH = os.path.join(DATA_DIR, "knowledge.pdf")
 INDEX_PATH = os.path.join(DATA_DIR, "tfidf_index.joblib")
-DOCS_PATH = os.path.join(DATA_DIR, "tfidf_docs.joblib")
+DOCS_PATH  = os.path.join(DATA_DIR, "tfidf_docs.joblib")
+MAX_PDFS   = 5
 
-# --------- UI Header ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Branding header (no “AI” wording)
+# ──────────────────────────────────────────────────────────────────────────────
 st.markdown(
     """
-    <div style="text-align:center">
-      <h1 style="margin-bottom:0">SWT Fitness — AI Support</h1>
-      <p style="margin-top:6px; color:#666">
-        Ask about classes, schedule, childcare, pricing, and more. Answers come only from your PDF.
-      </p>
+    <div style="text-align: center; margin-top: 10px;">
+        <h1 style="margin-bottom: 6px;">SWT Fitness Customer Support</h1>
+        <div style="font-size: 16px; color:#6c757d; margin-bottom: 8px;">
+            Powered by <b>ZARI</b>
+        </div>
+        <p style="font-size:15px; color:#444;">
+            Ask about classes, schedules, childcare, pricing, promotions, and more.
+        </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# --------- Helpers ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin auth (simple password via secrets)
+# ──────────────────────────────────────────────────────────────────────────────
+def is_admin() -> bool:
+    if st.session_state.get("is_admin"):
+        return True
+    pw_secret = st.secrets.get("ADMIN_PASSWORD", "")
+    # If not set, default to open admin for dev
+    if not pw_secret:
+        return True
+    return False
+
+def require_admin():
+    pw_secret = st.secrets.get("ADMIN_PASSWORD", "")
+    if not pw_secret:
+        st.sidebar.info("ADMIN_PASSWORD not set in secrets — admin mode is OPEN (dev).")
+        st.session_state.is_admin = True
+        return
+
+    st.sidebar.subheader("Admin login")
+    with st.sidebar.form("admin_login", clear_on_submit=True):
+        pwd = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Unlock")
+        if ok:
+            if pwd == pw_secret:
+                st.session_state.is_admin = True
+                st.sidebar.success("Admin mode unlocked ✅")
+            else:
+                st.sidebar.error("Incorrect password.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers: chunking, PDF loading, TF‑IDF index build/load
+# ──────────────────────────────────────────────────────────────────────────────
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
     if not text:
         return []
@@ -46,13 +85,12 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
         start = end - overlap
     return chunks
 
-def load_pdf_to_docs(pdf_path: str) -> List[Dict[str, Any]]:
-    reader = PdfReader(pdf_path)
+def load_pdf_reader(reader: PdfReader, page_offset: int = 0) -> List[Dict[str, Any]]:
     docs: List[Dict[str, Any]] = []
     for i, page in enumerate(reader.pages):
         raw = page.extract_text() or ""
         for ch in chunk_text(raw):
-            docs.append({"page": i, "text": ch})
+            docs.append({"page": i + page_offset, "text": ch})
     return docs
 
 def fit_tfidf(docs: List[Dict[str, Any]]):
@@ -65,47 +103,55 @@ def fit_tfidf(docs: List[Dict[str, Any]]):
         min_df=1,
         max_features=50000,
     )
-    X = vectorizer.fit_transform(corpus)  # sparse matrix
+    X = vectorizer.fit_transform(corpus)
     return vectorizer, X
 
 @st.cache_resource(show_spinner=False)
-def build_or_load_index() -> Tuple[TfidfVectorizer, Any, List[Dict[str, Any]]]:
+def load_index_cached() -> Tuple[TfidfVectorizer, Any, List[Dict[str, Any]]]:
+    """Load the TF‑IDF index from disk (cached)."""
+    if not (os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH)):
+        raise RuntimeError("No knowledge base is loaded. Please ask an admin to build it.")
+    pack = joblib.load(INDEX_PATH)
+    docs = joblib.load(DOCS_PATH)
+    return pack["vectorizer"], pack["matrix"], docs
+
+def build_index_from_inputs(pdf_files: List[BytesIO], pasted_text: str = ""):
     """
-    Load cached TF‑IDF index if present; otherwise build from PDF if available.
-    Cached by Streamlit between reruns.
+    Build/replace the TF‑IDF index from up to MAX_PDFS PDFs and optional pasted text.
+    Overwrites prior index.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH):
-        pack = joblib.load(INDEX_PATH)
-        docs = joblib.load(DOCS_PATH)
-        return pack["vectorizer"], pack["matrix"], docs
 
-    if not os.path.exists(PDF_PATH):
-        raise RuntimeError("No index found. Upload a PDF and click 'Build / Rebuild Knowledge Base'.")
+    docs: List[Dict[str, Any]] = []
+    total = min(len(pdf_files or []), MAX_PDFS)
 
-    docs = load_pdf_to_docs(PDF_PATH)
+    page_offset = 0
+    if pdf_files:
+        for f in pdf_files[:total]:
+            reader = PdfReader(BytesIO(f.read()))
+            file_docs = load_pdf_reader(reader, page_offset=page_offset)
+            docs.extend(file_docs)
+            page_offset += len(reader.pages)
+
+    pasted_text = (pasted_text or "").strip()
+    if pasted_text:
+        for ch in chunk_text(pasted_text):
+            docs.append({"page": -1, "text": ch})
+
     if not docs:
-        raise RuntimeError("Could not read any text from the PDF.")
+        raise RuntimeError("No content provided. Upload at least one PDF or paste text.")
+
     vectorizer, X = fit_tfidf(docs)
     joblib.dump({"vectorizer": vectorizer, "matrix": X}, INDEX_PATH)
     joblib.dump(docs, DOCS_PATH)
-    return vectorizer, X, docs
-
-def reindex_from_uploaded_pdf(file_bytes: bytes):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(PDF_PATH, "wb") as f:
-        f.write(file_bytes)
-    # Clear cache so next call rebuilds
-    build_or_load_index.clear()
-    # Build once to prime cache
-    build_or_load_index()
+    load_index_cached.clear()  # refresh cache
 
 def answer_question(user_text: str) -> Tuple[str, List[str]]:
-    vec, X, docs = build_or_load_index()
+    vec, X, docs = load_index_cached()
     q = vec.transform([user_text])
     sims = cosine_similarity(q, X)[0]
     if sims.size == 0 or np.max(sims) <= 0:
-        return "Sorry, I don’t have that information in the PDF.", []
+        return "Sorry, I don’t have that information in the knowledge base.", []
     top_idx = np.argsort(-sims)[:4].tolist()
     best = docs[top_idx[0]]["text"].strip()
     if len(best) > 1200:
@@ -113,57 +159,75 @@ def answer_question(user_text: str) -> Tuple[str, List[str]]:
 
     def label(i: int) -> str:
         p = docs[i].get("page")
-        return f"Page {p + 1}" if isinstance(p, int) else "Source"
+        return f"Page {p + 1}" if isinstance(p, int) and p >= 0 else "Pasted content"
 
     sources = [label(i) for i in top_idx]
     return best, sources
 
-def synthesize_tts_bytes(text: str) -> bytes | None:
+def synthesize_tts_bytes(text: str) -> Optional[bytes]:
     try:
         from gtts import gTTS
         buf = BytesIO()
         gTTS(text=text, lang="en").write_to_fp(buf)
         buf.seek(0)
-        return buf.read()  # MP3 bytes
+        return buf.read()
     except Exception:
         return None
 
-# --------- Knowledge base controls ----------
-with st.expander("📄 Load or replace knowledge base (PDF)"):
-    st.write("Upload your SWT Fitness PDF. The bot will only answer from this document.")
-    uploaded = st.file_uploader("Choose a PDF", type=["pdf"])
-    if st.button("Build / Rebuild Knowledge Base", type="primary", use_container_width=True):
-        if not uploaded:
-            st.error("Please upload a PDF first.")
-        else:
-            with st.spinner("Indexing PDF (chunking + TF‑IDF)…"):
-                reindex_from_uploaded_pdf(uploaded.read())
-            st.success("Knowledge base ready ✅")
-
-# --------- Sidebar options ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Sidebar (user options + admin gate)
+# ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Options")
     show_sources = st.toggle("Show sources", value=True)
-    use_tts = st.toggle("Voice reply (gTTS)", value=False, help="Generate an audio reply.")
+    use_tts = st.toggle("Voice reply (optional)", value=False, help="Play the answer as audio.")
     st.markdown("---")
-    st.caption("Runs on Streamlit free tier: TF‑IDF retriever only (no paid APIs).")
+    if is_admin():
+        st.success("Admin mode")
+    else:
+        require_admin()
+    st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
 
-# --------- Chat state ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin-only KB management
+# ──────────────────────────────────────────────────────────────────────────────
+if is_admin():
+    with st.expander("🛠️ Admin • Load / replace knowledge base (PDF/Text)"):
+        st.write(f"Upload **up to {MAX_PDFS} PDFs** and/or paste gym info. Rebuilding overwrites the previous index.")
+        pdf_files = st.file_uploader("PDF files", type=["pdf"], accept_multiple_files=True)
+        pasted_text = st.text_area(
+            "Optional pasted content (schedule, pricing, policies, FAQs)…",
+            height=180,
+            placeholder="SWT Fitness\nAddress: 10076 Southern Maryland Blvd, Dunkirk, MD\nHours: ...\nClasses: ...\nPricing: ...\nChildcare: ...\nPromotions: ...",
+        )
+        if st.button("Build / Rebuild Knowledge Base", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Indexing content…"):
+                    build_index_from_inputs(pdf_files or [], pasted_text=pasted_text)
+                st.success("Knowledge base ready ✅")
+            except Exception as e:
+                st.error(f"Error: {e}")
+else:
+    with st.expander("About the knowledge base"):
+        st.info("This customer support tool answers from an internal knowledge base maintained by admins.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Chat state & UI
+# ──────────────────────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
     st.session_state.messages.append(
-        {"role": "assistant", "content": "Hi! I’m the SWT Fitness assistant. Ask me anything from the PDF."}
+        {"role": "assistant", "content": "Hi! How can we help today?"}
     )
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# --------- Chat input / handler ----------
 def handle(q: str):
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("assistant"):
-        with st.spinner("Searching your PDF…"):
+        with st.spinner("Searching…"):
             try:
                 reply, sources = answer_question(q)
             except Exception as e:
@@ -180,8 +244,11 @@ def handle(q: str):
                         st.write(f"- {s}")
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
-user_q = st.chat_input("Ask about schedule, memberships, childcare, etc.")
+user_q = st.chat_input("Type your question (schedule, memberships, childcare, etc.)")
 if user_q:
     handle(user_q)
 
-st.markdown("<hr/><small>Built with Streamlit • PDF search (RAG‑only) • © SWT Fitness</small>", unsafe_allow_html=True)
+st.markdown(
+    "<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>",
+    unsafe_allow_html=True,
+)
