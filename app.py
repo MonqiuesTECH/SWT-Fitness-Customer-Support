@@ -22,7 +22,7 @@ DOCS_PATH  = os.path.join(DATA_DIR, "tfidf_docs.joblib")
 MAX_PDFS   = 5
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Branding header (no “AI” wording)
+# Branding header
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown(
     """
@@ -40,22 +40,19 @@ st.markdown(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Admin auth with login + logout
+# Admin auth with login + logout (hardcoded password)
 # ──────────────────────────────────────────────────────────────────────────────
+ADMIN_PASSWORD = "MoniqueIsTheBest1994"   # <<< hardcoded password
+
 def is_admin() -> bool:
     return st.session_state.get("is_admin", False)
 
 def login_admin():
-    """Render login form in the sidebar."""
-    pw_secret = st.secrets.get("ADMIN_PASSWORD", "")
-    if not pw_secret:
-        st.sidebar.warning("ADMIN_PASSWORD not set in secrets — admin login disabled (dev mode).")
-        return
     with st.sidebar.form("admin_login", clear_on_submit=True):
         pwd = st.text_input("Admin password", type="password")
         ok = st.form_submit_button("Unlock")
         if ok:
-            if pwd == pw_secret:
+            if pwd == ADMIN_PASSWORD:
                 st.session_state.is_admin = True
                 st.sidebar.success("Admin mode unlocked ✅")
             else:
@@ -66,7 +63,7 @@ def logout_admin():
     st.sidebar.info("Logged out of Admin mode.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers: chunking, PDF loading, TF‑IDF index build/load
+# Helpers: chunking, PDF loading, TF-IDF index build/load
 # ──────────────────────────────────────────────────────────────────────────────
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
     if not text:
@@ -104,7 +101,6 @@ def fit_tfidf(docs: List[Dict[str, Any]]):
 
 @st.cache_resource(show_spinner=False)
 def load_index_cached() -> Tuple[TfidfVectorizer, Any, List[Dict[str, Any]]]:
-    """Load the TF‑IDF index from disk (cached)."""
     if not (os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH)):
         raise RuntimeError("No knowledge base is loaded. Please ask an admin to build it.")
     pack = joblib.load(INDEX_PATH)
@@ -112,15 +108,9 @@ def load_index_cached() -> Tuple[TfidfVectorizer, Any, List[Dict[str, Any]]]:
     return pack["vectorizer"], pack["matrix"], docs
 
 def build_index_from_inputs(pdf_files: List[BytesIO], pasted_text: str = ""):
-    """
-    Build/replace the TF‑IDF index from up to MAX_PDFS PDFs and optional pasted text.
-    Overwrites prior index.
-    """
     os.makedirs(DATA_DIR, exist_ok=True)
-
     docs: List[Dict[str, Any]] = []
     total = min(len(pdf_files or []), MAX_PDFS)
-
     page_offset = 0
     if pdf_files:
         for f in pdf_files[:total]:
@@ -128,19 +118,16 @@ def build_index_from_inputs(pdf_files: List[BytesIO], pasted_text: str = ""):
             file_docs = load_pdf_reader(reader, page_offset=page_offset)
             docs.extend(file_docs)
             page_offset += len(reader.pages)
-
     pasted_text = (pasted_text or "").strip()
     if pasted_text:
         for ch in chunk_text(pasted_text):
             docs.append({"page": -1, "text": ch})
-
     if not docs:
         raise RuntimeError("No content provided. Upload at least one PDF or paste text.")
-
     vectorizer, X = fit_tfidf(docs)
     joblib.dump({"vectorizer": vectorizer, "matrix": X}, INDEX_PATH)
     joblib.dump(docs, DOCS_PATH)
-    load_index_cached.clear()  # refresh cache
+    load_index_cached.clear()
 
 def answer_question(user_text: str) -> Tuple[str, List[str]]:
     vec, X, docs = load_index_cached()
@@ -152,11 +139,9 @@ def answer_question(user_text: str) -> Tuple[str, List[str]]:
     best = docs[top_idx[0]]["text"].strip()
     if len(best) > 1200:
         best = best[:1200] + "…"
-
     def label(i: int) -> str:
         p = docs[i].get("page")
         return f"Page {p + 1}" if isinstance(p, int) and p >= 0 else "Pasted content"
-
     sources = [label(i) for i in top_idx]
     return best, sources
 
@@ -171,25 +156,23 @@ def synthesize_tts_bytes(text: str) -> Optional[bytes]:
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sidebar (user options + admin login/logout)
+# Sidebar (options + admin login/logout)
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Options")
     show_sources = st.toggle("Show sources", value=True)
     use_tts = st.toggle("Voice reply (optional)", value=False, help="Play the answer as audio.")
     st.markdown("---")
-
     if is_admin():
         st.success("Admin mode")
         if st.button("Log out"):
             logout_admin()
     else:
         login_admin()
-
     st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Admin-only KB management (visible only when logged in)
+# Admin-only KB management
 # ──────────────────────────────────────────────────────────────────────────────
 if is_admin():
     with st.expander("🛠️ Admin • Load / replace knowledge base (PDF/Text)"):
