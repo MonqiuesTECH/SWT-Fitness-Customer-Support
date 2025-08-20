@@ -16,7 +16,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💪", layout="centered")
 
-DATA_DIR = "data"
+DATA_DIR  = "data"
 INDEX_PATH = os.path.join(DATA_DIR, "tfidf_index.joblib")
 DOCS_PATH  = os.path.join(DATA_DIR, "tfidf_docs.joblib")
 MAX_PDFS   = 5
@@ -40,27 +40,19 @@ st.markdown(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Admin auth (simple password via secrets)
+# Admin auth with login + logout
 # ──────────────────────────────────────────────────────────────────────────────
 def is_admin() -> bool:
-    if st.session_state.get("is_admin"):
-        return True
-    pw_secret = st.secrets.get("ADMIN_PASSWORD", "")
-    # If not set, default to open admin for dev
-    if not pw_secret:
-        return True
-    return False
+    return st.session_state.get("is_admin", False)
 
-def require_admin():
+def login_admin():
+    """Render login form in the sidebar."""
     pw_secret = st.secrets.get("ADMIN_PASSWORD", "")
     if not pw_secret:
-        st.sidebar.info("ADMIN_PASSWORD not set in secrets — admin mode is OPEN (dev).")
-        st.session_state.is_admin = True
+        st.sidebar.warning("ADMIN_PASSWORD not set in secrets — admin login disabled (dev mode).")
         return
-
-    st.sidebar.subheader("Admin login")
     with st.sidebar.form("admin_login", clear_on_submit=True):
-        pwd = st.text_input("Password", type="password")
+        pwd = st.text_input("Admin password", type="password")
         ok = st.form_submit_button("Unlock")
         if ok:
             if pwd == pw_secret:
@@ -68,6 +60,10 @@ def require_admin():
                 st.sidebar.success("Admin mode unlocked ✅")
             else:
                 st.sidebar.error("Incorrect password.")
+
+def logout_admin():
+    st.session_state.is_admin = False
+    st.sidebar.info("Logged out of Admin mode.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers: chunking, PDF loading, TF‑IDF index build/load
@@ -175,21 +171,25 @@ def synthesize_tts_bytes(text: str) -> Optional[bytes]:
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sidebar (user options + admin gate)
+# Sidebar (user options + admin login/logout)
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Options")
     show_sources = st.toggle("Show sources", value=True)
     use_tts = st.toggle("Voice reply (optional)", value=False, help="Play the answer as audio.")
     st.markdown("---")
+
     if is_admin():
         st.success("Admin mode")
+        if st.button("Log out"):
+            logout_admin()
     else:
-        require_admin()
+        login_admin()
+
     st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Admin-only KB management
+# Admin-only KB management (visible only when logged in)
 # ──────────────────────────────────────────────────────────────────────────────
 if is_admin():
     with st.expander("🛠️ Admin • Load / replace knowledge base (PDF/Text)"):
@@ -216,9 +216,7 @@ else:
 # ──────────────────────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
-    st.session_state.messages.append(
-        {"role": "assistant", "content": "Hi! How can we help today?"}
-    )
+    st.session_state.messages.append({"role": "assistant", "content": "Hi! How can we help today?"})
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -248,7 +246,4 @@ user_q = st.chat_input("Type your question (schedule, memberships, childcare, et
 if user_q:
     handle(user_q)
 
-st.markdown(
-    "<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>",
-    unsafe_allow_html=True,
-)
+st.markdown("<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>", unsafe_allow_html=True)
