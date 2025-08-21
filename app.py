@@ -293,6 +293,10 @@ if user_msg:
         # your existing RAG → LLM → answer code
         answer = answer_question(user_msg)  # whatever you already use
         st.chat_message("assistant").write(answer)
+        from leads import add_lead
+# ...
+add_lead(name, email, phone, interest="Trial", source="web")
+
 
 
 st.markdown("<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>", unsafe_allow_html=True)
