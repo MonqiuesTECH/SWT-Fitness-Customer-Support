@@ -1,6 +1,10 @@
 import os
 from io import BytesIO
 from typing import List, Tuple, Dict, Any, Optional
+import datetime as dt, pytz, streamlit as st
+from intents import wants_handoff
+from calendly_api import list_available_times, create_single_use_link
+
 
 import streamlit as st
 
@@ -11,10 +15,59 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+
+def show_manager_slots():
+    if not (CALENDLY_PAT and CALENDLY_EVENT_TYPE):
+        st.warning("Scheduling isn’t configured yet. Ask an admin to add CALENDLY_* secrets.")
+        return
+
+    tz = pytz.timezone(CALENDLY_TZ)
+    now = dt.datetime.now(tz)
+    start, end = now, now + dt.timedelta(days=7)
+
+    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
+    try:
+        slots = list_available_times(CALENDLY_PAT, CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
+    except Exception:
+        st.error("Couldn’t reach the scheduler right now. Try again in a moment.")
+        if st.button("Open scheduler in a new tab"):
+            url = create_single_use_link(CALENDLY_PAT, CALENDLY_EVENT_TYPE)
+            st.write(f'<a href="{url}" target="_blank" rel="noopener">Open scheduler</a>', unsafe_allow_html=True)
+        return
+
+    if not slots:
+        st.info("No open slots in the next 7 days.")
+        if st.button("See more dates"):
+            url = create_single_use_link(CALENDLY_PAT, CALENDLY_EVENT_TYPE)
+            st.write(f'<a href="{url}" target="_blank" rel="noopener">Open scheduler</a>', unsafe_allow_html=True)
+        return
+
+    # Group by day and render slot buttons
+    from collections import defaultdict
+    by_day = defaultdict(list)
+    for s in slots:
+        t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
+        by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
+
+    for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
+        with st.expander(day, expanded=len(by_day)==1):
+            for t, url in entries:
+                label = t.strftime("%-I:%M %p")
+                st.write(
+                    f'<a href="{url}" target="_blank" rel="noopener" '
+                    f'style="display:inline-block;margin:6px 8px;padding:8px 12px;'
+                    f'border-radius:10px;border:1px solid #ddd;text-decoration:none;">'
+                    f'Book {label}</a>',
+                    unsafe_allow_html=True,
+                )
+
 # ──────────────────────────────────────────────────────────────────────────────
 # App / constants
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💪", layout="centered")
+CALENDLY_PAT = st.secrets.get("CALENDLY_PAT")
+CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE")
+CALENDLY_TZ = st.secrets.get("CALENDLY_TZ", "America/New_York")
 
 DATA_DIR  = "data"
 INDEX_PATH = os.path.join(DATA_DIR, "tfidf_index.joblib")
@@ -228,5 +281,18 @@ def handle(q: str):
 user_q = st.chat_input("Type your question (schedule, memberships, childcare, etc.)")
 if user_q:
     handle(user_q)
+    user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)")
+
+if user_msg:
+    st.chat_message("user").write(user_msg)
+
+    # NEW: human handoff trigger
+    if wants_handoff(user_msg):
+        show_manager_slots()
+    else:
+        # your existing RAG → LLM → answer code
+        answer = answer_question(user_msg)  # whatever you already use
+        st.chat_message("assistant").write(answer)
+
 
 st.markdown("<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>", unsafe_allow_html=True)
