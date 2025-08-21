@@ -7,3 +7,5 @@ joblib>=1.3.2
 
 # Optional for voice reply toggle
 gTTS>=2.5.3
+requests
+pytz
