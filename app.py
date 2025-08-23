@@ -1,302 +1,325 @@
+from __future__ import annotations
+
+import io
 import os
-from io import BytesIO
-from typing import List, Tuple, Dict, Any, Optional
-import datetime as dt, pytz, streamlit as st
+import json
+import re
+import time
+import textwrap
+import datetime as dt
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import streamlit as st
+import pdfplumber
+import pytz
+import faiss
+
+from sentence_transformers import SentenceTransformer
+
 from intents import wants_handoff
 from calendly_api import list_available_times, create_single_use_link
+from leads import add_lead  # optional; no-op if you don't use it
 
+# ------------- Page & global config -------------
+st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💬", layout="wide")
 
-import streamlit as st
+STUDIO_NAME = st.secrets.get("STUDIO_NAME", "SWT Fitness")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 
-# Lightweight text pipeline (no paid APIs)
-from pypdf import PdfReader
-import joblib
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-
-def show_manager_slots():
-    if not (CALENDLY_PAT and CALENDLY_EVENT_TYPE):
-        st.warning("Scheduling isn’t configured yet. Ask an admin to add CALENDLY_* secrets.")
-        return
-
-    tz = pytz.timezone(CALENDLY_TZ)
-    now = dt.datetime.now(tz)
-    start, end = now, now + dt.timedelta(days=7)
-
-    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
-    try:
-        slots = list_available_times(CALENDLY_PAT, CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
-    except Exception:
-        st.error("Couldn’t reach the scheduler right now. Try again in a moment.")
-        if st.button("Open scheduler in a new tab"):
-            url = create_single_use_link(CALENDLY_PAT, CALENDLY_EVENT_TYPE)
-            st.write(f'<a href="{url}" target="_blank" rel="noopener">Open scheduler</a>', unsafe_allow_html=True)
-        return
-
-    if not slots:
-        st.info("No open slots in the next 7 days.")
-        if st.button("See more dates"):
-            url = create_single_use_link(CALENDLY_PAT, CALENDLY_EVENT_TYPE)
-            st.write(f'<a href="{url}" target="_blank" rel="noopener">Open scheduler</a>', unsafe_allow_html=True)
-        return
-
-    # Group by day and render slot buttons
-    from collections import defaultdict
-    by_day = defaultdict(list)
-    for s in slots:
-        t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
-        by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
-
-    for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
-        with st.expander(day, expanded=len(by_day)==1):
-            for t, url in entries:
-                label = t.strftime("%-I:%M %p")
-                st.write(
-                    f'<a href="{url}" target="_blank" rel="noopener" '
-                    f'style="display:inline-block;margin:6px 8px;padding:8px 12px;'
-                    f'border-radius:10px;border:1px solid #ddd;text-decoration:none;">'
-                    f'Book {label}</a>',
-                    unsafe_allow_html=True,
-                )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# App / constants
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💪", layout="centered")
-CALENDLY_PAT = st.secrets.get("CALENDLY_PAT")
-CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE")
+CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
+CALENDLY_URL = st.secrets.get("CALENDLY_URL", "").strip()
 CALENDLY_TZ = st.secrets.get("CALENDLY_TZ", "America/New_York")
 
-DATA_DIR  = "data"
-INDEX_PATH = os.path.join(DATA_DIR, "tfidf_index.joblib")
-DOCS_PATH  = os.path.join(DATA_DIR, "tfidf_docs.joblib")
-MAX_PDFS   = 5
+DATA_DIR = "/mnt/data"
+INDEX_PATH = os.path.join(DATA_DIR, "kb_index.faiss")
+EMB_PATH = os.path.join(DATA_DIR, "kb_emb.npy")
+META_PATH = os.path.join(DATA_DIR, "kb_meta.json")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Branding header
-# ──────────────────────────────────────────────────────────────────────────────
-st.markdown(
-    """
-    <div style="text-align: center; margin-top: 10px;">
-        <h1 style="margin-bottom: 6px;">SWT Fitness Customer Support</h1>
-        <div style="font-size: 16px; color:#6c757d; margin-bottom: 8px;">
-            Powered by <b>ZARI</b>
-        </div>
-        <p style="font-size:15px; color:#444;">
-            Ask about classes, schedules, childcare, pricing, promotions, and more.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin auth with login + logout (hardcoded password)
-# ──────────────────────────────────────────────────────────────────────────────
-ADMIN_PASSWORD = "MoniqueIsTheBest1994"   # <<< hardcoded password
-
-def is_admin() -> bool:
-    return st.session_state.get("is_admin", False)
-
-def login_admin():
-    with st.sidebar.form("admin_login", clear_on_submit=True):
-        pwd = st.text_input("Admin password", type="password")
-        ok = st.form_submit_button("Unlock")
-        if ok:
-            if pwd == ADMIN_PASSWORD:
-                st.session_state.is_admin = True
-                st.sidebar.success("Admin mode unlocked ✅")
-            else:
-                st.sidebar.error("Incorrect password.")
-
-def logout_admin():
+# ------------- Session state -------------
+if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-    st.sidebar.info("Logged out of Admin mode.")
+if "kb_ready" not in st.session_state:
+    st.session_state.kb_ready = False
+if "show_sources" not in st.session_state:
+    st.session_state.show_sources = True
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # list[(role, text)]
+if "embed_model_name" not in st.session_state:
+    st.session_state.embed_model_name = "sentence-transformers/all-MiniLM-L6-v2"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers: chunking, PDF loading, TF-IDF index build/load
-# ──────────────────────────────────────────────────────────────────────────────
-def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
-    if not text:
+# ------------- Embeddings / FAISS -------------
+@dataclass
+class KB:
+    index: Any
+    embeddings: np.ndarray
+    chunks: List[str]
+    sources: List[str]
+
+def _load_model():
+    # Cache across reruns
+    if "embed_model" not in st.session_state:
+        st.session_state.embed_model = SentenceTransformer(st.session_state.embed_model_name)
+    return st.session_state.embed_model
+
+def _chunk(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+    words = text.split()
+    if not words:
         return []
-    chunks, start = [], 0
-    n = len(text)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunks.append(text[start:end])
-        if end == n:
-            break
-        start = end - overlap
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk))
+        i += (chunk_size - overlap)
     return chunks
 
-def load_pdf_reader(reader: PdfReader, page_offset: int = 0) -> List[Dict[str, Any]]:
-    docs: List[Dict[str, Any]] = []
-    for i, page in enumerate(reader.pages):
-        raw = page.extract_text() or ""
-        for ch in chunk_text(raw):
-            docs.append({"page": i + page_offset, "text": ch})
-    return docs
+def _read_pdf(file: io.BytesIO) -> str:
+    text = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t:
+                text.append(t)
+    return "\n".join(text)
 
-def fit_tfidf(docs: List[Dict[str, Any]]):
-    corpus = [d["text"] for d in docs]
-    vectorizer = TfidfVectorizer(
-        lowercase=True,
-        stop_words="english",
-        ngram_range=(1, 2),
-        max_df=0.9,
-        min_df=1,
-        max_features=50000,
-    )
-    X = vectorizer.fit_transform(corpus)
-    return vectorizer, X
+def _build_index(from_files: List[io.BytesIO], filenames: List[str]) -> KB:
+    # Read + chunk
+    all_chunks: List[str] = []
+    sources: List[str] = []
+    for file, name in zip(from_files, filenames):
+        file.seek(0)
+        txt = _read_pdf(file)
+        for ch in _chunk(txt, 500, 120):
+            all_chunks.append(ch)
+            sources.append(name)
 
-@st.cache_resource(show_spinner=False)
-def load_index_cached() -> Tuple[TfidfVectorizer, Any, List[Dict[str, Any]]]:
-    if not (os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH)):
-        raise RuntimeError("No knowledge base is loaded. Please ask an admin to build it.")
-    pack = joblib.load(INDEX_PATH)
-    docs = joblib.load(DOCS_PATH)
-    return pack["vectorizer"], pack["matrix"], docs
+    model = _load_model()
+    embs = model.encode(all_chunks, convert_to_numpy=True, normalize_embeddings=True)
+    d = embs.shape[1]
+    index = faiss.IndexFlatIP(d)
+    index.add(embs.astype(np.float32))
 
-def build_index_from_inputs(pdf_files: List[BytesIO], pasted_text: str = ""):
+    # Persist
     os.makedirs(DATA_DIR, exist_ok=True)
-    docs: List[Dict[str, Any]] = []
-    total = min(len(pdf_files or []), MAX_PDFS)
-    page_offset = 0
-    if pdf_files:
-        for f in pdf_files[:total]:
-            reader = PdfReader(BytesIO(f.read()))
-            file_docs = load_pdf_reader(reader, page_offset=page_offset)
-            docs.extend(file_docs)
-            page_offset += len(reader.pages)
-    pasted_text = (pasted_text or "").strip()
-    if pasted_text:
-        for ch in chunk_text(pasted_text):
-            docs.append({"page": -1, "text": ch})
-    if not docs:
-        raise RuntimeError("No content provided. Upload at least one PDF or paste text.")
-    vectorizer, X = fit_tfidf(docs)
-    joblib.dump({"vectorizer": vectorizer, "matrix": X}, INDEX_PATH)
-    joblib.dump(docs, DOCS_PATH)
-    load_index_cached.clear()
+    faiss.write_index(index, INDEX_PATH)
+    np.save(EMB_PATH, embs)
+    with open(META_PATH, "w") as f:
+        json.dump({"chunks": all_chunks, "sources": sources}, f)
 
-def answer_question(user_text: str) -> Tuple[str, List[str]]:
-    vec, X, docs = load_index_cached()
-    q = vec.transform([user_text])
-    sims = cosine_similarity(q, X)[0]
-    if sims.size == 0 or np.max(sims) <= 0:
-        return "Sorry, I don’t have that information in the knowledge base.", []
-    top_idx = np.argsort(-sims)[:4].tolist()
-    best = docs[top_idx[0]]["text"].strip()
-    if len(best) > 1200:
-        best = best[:1200] + "…"
-    def label(i: int) -> str:
-        p = docs[i].get("page")
-        return f"Page {p + 1}" if isinstance(p, int) and p >= 0 else "Pasted content"
-    sources = [label(i) for i in top_idx]
-    return best, sources
+    return KB(index=index, embeddings=embs, chunks=all_chunks, sources=sources)
 
-def synthesize_tts_bytes(text: str) -> Optional[bytes]:
+def _load_index_if_exists() -> KB | None:
     try:
-        from gtts import gTTS
-        buf = BytesIO()
-        gTTS(text=text, lang="en").write_to_fp(buf)
-        buf.seek(0)
-        return buf.read()
+        if not (os.path.exists(INDEX_PATH) and os.path.exists(META_PATH)):
+            return None
+        index = faiss.read_index(INDEX_PATH)
+        embs = np.load(EMB_PATH)
+        with open(META_PATH) as f:
+            meta = json.load(f)
+        return KB(index=index, embeddings=embs, chunks=meta["chunks"], sources=meta["sources"])
     except Exception:
         return None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Sidebar (options + admin login/logout)
-# ──────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.subheader("Options")
-    show_sources = st.toggle("Show sources", value=True)
-    use_tts = st.toggle("Voice reply (optional)", value=False, help="Play the answer as audio.")
-    st.markdown("---")
-    if is_admin():
-        st.success("Admin mode")
-        if st.button("Log out"):
-            logout_admin()
+def _retrieve(kb: KB, query: str, k: int = 4) -> List[Tuple[str, str, float]]:
+    model = _load_model()
+    q = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+    sims, idx = kb.index.search(q, min(k, len(kb.chunks)))
+    out = []
+    for i, score in zip(idx[0], sims[0]):
+        if i < 0:
+            continue
+        out.append((kb.chunks[i], kb.sources[i], float(score)))
+    return out
+
+# ------------- Lightweight answerer (no paid LLM) -------------
+def _compose_answer(question: str, hits: List[Tuple[str, str, float]]) -> str:
+    if not hits:
+        return (
+            "I couldn’t find that in our documents. Would you like to "
+            "speak with a team member? Say “I want to speak with someone.”"
+        )
+    # Extractive summary: pick top snippets and compress slightly
+    context = "\n\n".join([h[0] for h in hits])
+    # Simple compression: keep sentences that contain query keywords
+    kws = [w for w in re.findall(r"[A-Za-z0-9]+", question.lower()) if len(w) > 3]
+    sentences = re.split(r"(?<=[.!?])\s+", context)
+    picked = []
+    for s in sentences:
+        ls = s.lower()
+        if any(k in ls for k in kws) or len(picked) < 3:
+            picked.append(s.strip())
+        if len(" ".join(picked)) > 700:
+            break
+    answer = " ".join(picked).strip()
+    if not answer:
+        answer = sentences[0].strip()
+    # Keep it concise
+    return textwrap.shorten(answer, width=800, placeholder="…")
+
+def answer_question(question: str) -> str:
+    kb: KB | None = st.session_state.get("kb_obj")
+    if not kb:
+        # Try load from disk on first query
+        kb = _load_index_if_exists()
+        if kb:
+            st.session_state.kb_obj = kb
+            st.session_state.kb_ready = True
+    if not kb:
+        return ("The knowledge base isn’t loaded yet. Go to Admin → upload PDFs, then ask again.")
+    hits = _retrieve(kb, question, k=4)
+    ans = _compose_answer(question, hits)
+    if st.session_state.show_sources and hits:
+        # Append compact sources
+        unique = []
+        for _, src, _ in hits:
+            if src not in unique:
+                unique.append(src)
+        ans += "\n\n_sources: " + ", ".join(unique[:4])
+    return ans
+
+# ------------- Calendly handoff UI -------------
+def show_manager_slots():
+    tz = pytz.timezone(CALENDLY_TZ)
+    now = dt.datetime.now(tz)
+    start, end = now, now + dt.timedelta(days=7)
+    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
+
+    if CALENDLY_EVENT_TYPE:
+        try:
+            slots = list_available_times(CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
+        except Exception:
+            st.error("Scheduler temporarily unavailable.")
+            if CALENDLY_URL:
+                st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+            return
+
+        if not slots:
+            st.info("No open slots in the next 7 days.")
+            try:
+                url = create_single_use_link(CALENDLY_EVENT_TYPE)
+                st.write(f'<a href="{url}" target="_blank" rel="noopener">See more dates</a>', unsafe_allow_html=True)
+            except Exception:
+                if CALENDLY_URL:
+                    st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+            return
+
+        from collections import defaultdict
+        by_day = defaultdict(list)
+        for s in slots:
+            t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
+            by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
+
+        for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
+            with st.expander(day, expanded=len(by_day) == 1):
+                for t, url in entries:
+                    label = t.strftime("%-I:%M %p")
+                    st.write(
+                        f'<a href="{url}" target="_blank" rel="noopener" '
+                        f'style="display:inline-block;margin:6px 8px;padding:8px 12px;'
+                        f'border-radius:10px;border:1px solid #ddd;text-decoration:none;">'
+                        f'Book {label}</a>',
+                        unsafe_allow_html=True,
+                    )
+        return
+
+    if CALENDLY_URL:
+        st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
     else:
-        login_admin()
+        st.warning("Calendly not configured. Add CALENDLY_EVENT_TYPE or CALENDLY_URL in secrets.")
+
+# ------------- Sidebar (options + admin) -------------
+with st.sidebar:
+    st.toggle("Show sources", value=st.session_state.show_sources, key="show_sources")
     st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin-only KB management
-# ──────────────────────────────────────────────────────────────────────────────
-if is_admin():
-    with st.expander("🛠️ Admin • Load / replace knowledge base (PDF/Text)"):
-        st.write(f"Upload **up to {MAX_PDFS} PDFs** and/or paste gym info. Rebuilding overwrites the previous index.")
-        pdf_files = st.file_uploader("PDF files", type=["pdf"], accept_multiple_files=True)
-        pasted_text = st.text_area(
-            "Optional pasted content (schedule, pricing, policies, FAQs)…",
-            height=180,
-            placeholder="SWT Fitness\nAddress: 10076 Southern Maryland Blvd, Dunkirk, MD\nHours: ...\nClasses: ...\nPricing: ...\nChildcare: ...\nPromotions: ...",
-        )
-        if st.button("Build / Rebuild Knowledge Base", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Indexing content…"):
-                    build_index_from_inputs(pdf_files or [], pasted_text=pasted_text)
-                st.success("Knowledge base ready ✅")
-            except Exception as e:
-                st.error(f"Error: {e}")
-else:
-    with st.expander("About the knowledge base"):
-        st.info("This customer support tool answers from an internal knowledge base maintained by admins.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Chat state & UI
-# ──────────────────────────────────────────────────────────────────────────────
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-    st.session_state.messages.append({"role": "assistant", "content": "Hi! How can we help today?"})
-
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-def handle(q: str):
-    st.session_state.messages.append({"role": "user", "content": q})
-    with st.chat_message("assistant"):
-        with st.spinner("Searching…"):
-            try:
-                reply, sources = answer_question(q)
-            except Exception as e:
-                st.error(f"Error: {e}")
-                return
-            st.markdown(reply)
-            if use_tts:
-                audio = synthesize_tts_bytes(reply)
-                if audio:
-                    st.audio(audio, format="audio/mp3")
-            if show_sources and sources:
-                with st.expander("Sources"):
-                    for s in sources:
-                        st.write(f"- {s}")
-    st.session_state.messages.append({"role": "assistant", "content": reply})
-
-user_q = st.chat_input("Type your question (schedule, memberships, childcare, etc.)")
-if user_q:
-    handle(user_q)
-    user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)")
-
-if user_msg:
-    st.chat_message("user").write(user_msg)
-
-    # NEW: human handoff trigger
-    if wants_handoff(user_msg):
-        show_manager_slots()
+    st.markdown("---")
+    if not st.session_state.is_admin:
+        with st.popover("Admin mode"):
+            pw = st.text_input("Password", type="password")
+            if st.button("Log in"):
+                if pw == ADMIN_PASSWORD:
+                    st.session_state.is_admin = True
+                    st.success("Admin mode enabled.")
+                else:
+                    st.error("Wrong password.")
     else:
-        # your existing RAG → LLM → answer code
-        answer = answer_question(user_msg)  # whatever you already use
-        st.chat_message("assistant").write(answer)
-        from leads import add_lead
-# ...
-add_lead(name, email, phone, interest="Trial", source="web")
+        st.success("Admin mode")
+        if st.button("Log out"):
+            st.session_state.is_admin = False
 
+# ------------- Header -------------
+st.title(f"{STUDIO_NAME} Customer Support")
+st.caption("Ask about classes, schedules, childcare, pricing, promotions, and more.")
 
+# ------------- Admin panel -------------
+if st.session_state.is_admin:
+    st.subheader("Admin · Load / replace knowledge base (PDF/Text)")
+    uploaded = st.file_uploader(
+        "Upload one or more PDFs (membership pricing, policies, schedule, childcare).",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Build/Replace knowledge base", type="primary", use_container_width=True, disabled=(not uploaded)):
+            with st.spinner("Indexing documents…"):
+                kb = _build_index(
+                    from_files=[io.BytesIO(f.read()) for f in uploaded],
+                    filenames=[f.name for f in uploaded],
+                )
+                st.session_state.kb_obj = kb
+                st.session_state.kb_ready = True
+            st.success(f"Indexed {len(kb.chunks)} chunks from {len(set(kb.sources))} file(s).")
+    with col2:
+        if st.button("Load existing index from disk", use_container_width=True):
+            kb = _load_index_if_exists()
+            if kb:
+                st.session_state.kb_obj = kb
+                st.session_state.kb_ready = True
+                st.success(f"Loaded {len(kb.chunks)} chunks from disk.")
+            else:
+                st.warning("No saved index found yet.")
+    st.markdown("---")
 
-st.markdown("<hr/><small>© SWT Fitness • Customer Support • Powered by ZARI</small>", unsafe_allow_html=True)
+# ------------- Helper: one-turn dispatcher -------------
+def handle_turn(user_text: str):
+    if not user_text:
+        return
+    st.chat_message("user").write(user_text)
+
+    # Human handoff
+    if wants_handoff(user_text):
+        show_manager_slots()
+        return
+
+    # Answer from KB
+    ans = answer_question(user_text)
+    st.chat_message("assistant").write(ans)
+
+    # Simple lead capture hook (optional): detect interest keywords
+    if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition)\b", user_text, re.I):
+        with st.expander("Leave your info for a follow-up (optional)"):
+            with st.form(f"lead_{int(time.time())}"):
+                name = st.text_input("Name")
+                email = st.text_input("Email")
+                phone = st.text_input("Phone (optional)")
+                submitted = st.form_submit_button("Send to team")
+                if submitted and name and email:
+                    try:
+                        add_lead(name, email, phone, interest="From chat", source="web")
+                        st.success("Thanks! We’ll follow up shortly.")
+                    except Exception:
+                        st.info("Saved locally. (Lead sheet not configured.)")
+
+# ------------- Chat UI -------------
+# Restore prior messages (optional)
+for role, msg in st.session_state.chat_history:
+    st.chat_message(role).write(msg)
+
+user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)") or ""
+if user_msg:
+    st.session_state.chat_history.append(("user", user_msg))
+    # The assistant messages are rendered inside handle_turn, but for history, capture a placeholder
+    handle_turn(user_msg)
