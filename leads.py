@@ -1,15 +1,36 @@
-# leads.py
+# leads.py — safe when Google secrets are missing
 import json, datetime as dt
-import gspread
-from google.oauth2.service_account import Credentials
 import streamlit as st
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SA = json.loads(st.secrets["GOOGLE_SA_JSON"])
-CREDS = Credentials.from_service_account_info(SA, scopes=SCOPES)
-GC = gspread.authorize(CREDS)
-SHEET = GC.open_by_key(st.secrets["LEADS_SHEET_ID"]).worksheet("Leads")
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
 
-def add_lead(name: str, email: str, phone: str, interest: str, source: str = "chat"):
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _get_ws():
+    """Return the Google Sheet worksheet or None if not configured."""
+    try:
+        sa_json = st.secrets.get("GOOGLE_SA_JSON")
+        sheet_id = st.secrets.get("LEADS_SHEET_ID")
+        if not (sa_json and sheet_id and gspread and Credentials):
+            return None
+        creds = Credentials.from_service_account_info(json.loads(sa_json), scopes=SCOPES)
+        gc = gspread.authorize(creds)
+        return gc.open_by_key(sheet_id).worksheet("Leads")
+    except Exception:
+        return None
+
+def add_lead(name: str, email: str, phone: str, interest: str, source: str = "web") -> bool:
+    """Append a lead row. Returns True if written to Google Sheets, False if stored locally."""
     ts = dt.datetime.now().isoformat(timespec="seconds")
-    SHEET.append_row([ts, name, email, phone, interest, source], value_input_option="USER_ENTERED")
+    ws = _get_ws()
+    if ws is None:
+        # Fallback: hold locally so the app never crashes
+        st.session_state.setdefault("leads_local", []).append([ts, name, email, phone, interest, source])
+        return False
+    ws.append_row([ts, name, email, phone, interest, source], value_input_option="USER_ENTERED")
+    return True
