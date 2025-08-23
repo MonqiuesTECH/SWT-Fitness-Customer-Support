@@ -1,28 +1,29 @@
+# app.py (lightweight deploy-safe)
+# - PDF/Text RAG using pypdf + TF-IDF (scikit-learn)
+# - Admin upload + reindex
+# - Human handoff via Calendly API slot buttons
+# - Optional lead capture to Google Sheets (leads.py)
+
 from __future__ import annotations
 
-import io
-import os
-import json
-import re
-import time
-import textwrap
-import datetime as dt
+import io, os, json, re, time, textwrap, datetime as dt
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import streamlit as st
-import pdfplumber
+from pypdf import PdfReader
 import pytz
-import faiss
 
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import joblib
 
 from intents import wants_handoff
 from calendly_api import list_available_times, create_single_use_link
-from leads import add_lead  # optional; no-op if you don't use it
+from leads import add_lead  # optional; safe to ignore if not configured
 
-# ------------- Page & global config -------------
+# ---------- Page & secrets ----------
 st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💬", layout="wide")
 
 STUDIO_NAME = st.secrets.get("STUDIO_NAME", "SWT Fitness")
@@ -32,12 +33,12 @@ CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
 CALENDLY_URL = st.secrets.get("CALENDLY_URL", "").strip()
 CALENDLY_TZ = st.secrets.get("CALENDLY_TZ", "America/New_York")
 
-DATA_DIR = "/mnt/data"
-INDEX_PATH = os.path.join(DATA_DIR, "kb_index.faiss")
-EMB_PATH = os.path.join(DATA_DIR, "kb_emb.npy")
+DATA_DIR  = "/mnt/data"
+VEC_PATH  = os.path.join(DATA_DIR, "kb_vectorizer.joblib")
+MAT_PATH  = os.path.join(DATA_DIR, "kb_matrix.joblib")
 META_PATH = os.path.join(DATA_DIR, "kb_meta.json")
 
-# ------------- Session state -------------
+# ---------- Session ----------
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "kb_ready" not in st.session_state:
@@ -46,46 +47,34 @@ if "show_sources" not in st.session_state:
     st.session_state.show_sources = True
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list[(role, text)]
-if "embed_model_name" not in st.session_state:
-    st.session_state.embed_model_name = "sentence-transformers/all-MiniLM-L6-v2"
 
-# ------------- Embeddings / FAISS -------------
+# ---------- KB structures ----------
 @dataclass
 class KB:
-    index: Any
-    embeddings: np.ndarray
+    vectorizer: TfidfVectorizer
+    matrix: Any  # sparse matrix
     chunks: List[str]
     sources: List[str]
 
-def _load_model():
-    # Cache across reruns
-    if "embed_model" not in st.session_state:
-        st.session_state.embed_model = SentenceTransformer(st.session_state.embed_model_name)
-    return st.session_state.embed_model
-
-def _chunk(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+def _chunk(text: str, chunk_size: int = 500, overlap: int = 120) -> List[str]:
     words = text.split()
-    if not words:
-        return []
-    chunks = []
-    i = 0
+    if not words: return []
+    out, i = [], 0
     while i < len(words):
-        chunk = words[i:i + chunk_size]
-        chunks.append(" ".join(chunk))
+        out.append(" ".join(words[i:i+chunk_size]))
         i += (chunk_size - overlap)
-    return chunks
+    return out
 
 def _read_pdf(file: io.BytesIO) -> str:
     text = []
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t:
-                text.append(t)
+    reader = PdfReader(file)
+    for page in reader.pages:
+        t = page.extract_text() or ""
+        if t:
+            text.append(t)
     return "\n".join(text)
 
 def _build_index(from_files: List[io.BytesIO], filenames: List[str]) -> KB:
-    # Read + chunk
     all_chunks: List[str] = []
     sources: List[str] = []
     for file, name in zip(from_files, filenames):
@@ -95,54 +84,42 @@ def _build_index(from_files: List[io.BytesIO], filenames: List[str]) -> KB:
             all_chunks.append(ch)
             sources.append(name)
 
-    model = _load_model()
-    embs = model.encode(all_chunks, convert_to_numpy=True, normalize_embeddings=True)
-    d = embs.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(embs.astype(np.float32))
+    vectorizer = TfidfVectorizer(ngram_range=(1,2), max_features=50000, lowercase=True)
+    matrix = vectorizer.fit_transform(all_chunks)
 
-    # Persist
     os.makedirs(DATA_DIR, exist_ok=True)
-    faiss.write_index(index, INDEX_PATH)
-    np.save(EMB_PATH, embs)
+    joblib.dump(vectorizer, VEC_PATH)
+    joblib.dump(matrix, MAT_PATH)
     with open(META_PATH, "w") as f:
         json.dump({"chunks": all_chunks, "sources": sources}, f)
 
-    return KB(index=index, embeddings=embs, chunks=all_chunks, sources=sources)
+    return KB(vectorizer=vectorizer, matrix=matrix, chunks=all_chunks, sources=sources)
 
 def _load_index_if_exists() -> KB | None:
     try:
-        if not (os.path.exists(INDEX_PATH) and os.path.exists(META_PATH)):
+        if not (os.path.exists(VEC_PATH) and os.path.exists(MAT_PATH) and os.path.exists(META_PATH)):
             return None
-        index = faiss.read_index(INDEX_PATH)
-        embs = np.load(EMB_PATH)
-        with open(META_PATH) as f:
-            meta = json.load(f)
-        return KB(index=index, embeddings=embs, chunks=meta["chunks"], sources=meta["sources"])
+        vectorizer = joblib.load(VEC_PATH)
+        matrix = joblib.load(MAT_PATH)
+        meta = json.load(open(META_PATH))
+        return KB(vectorizer=vectorizer, matrix=matrix, chunks=meta["chunks"], sources=meta["sources"])
     except Exception:
         return None
 
 def _retrieve(kb: KB, query: str, k: int = 4) -> List[Tuple[str, str, float]]:
-    model = _load_model()
-    q = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-    sims, idx = kb.index.search(q, min(k, len(kb.chunks)))
+    qv = kb.vectorizer.transform([query])
+    sims = cosine_similarity(qv, kb.matrix).ravel()
+    topk_idx = np.argsort(-sims)[:k]
     out = []
-    for i, score in zip(idx[0], sims[0]):
-        if i < 0:
-            continue
-        out.append((kb.chunks[i], kb.sources[i], float(score)))
+    for i in topk_idx:
+        out.append((kb.chunks[i], kb.sources[i], float(sims[i])))
     return out
 
-# ------------- Lightweight answerer (no paid LLM) -------------
 def _compose_answer(question: str, hits: List[Tuple[str, str, float]]) -> str:
     if not hits:
-        return (
-            "I couldn’t find that in our documents. Would you like to "
-            "speak with a team member? Say “I want to speak with someone.”"
-        )
-    # Extractive summary: pick top snippets and compress slightly
+        return ("I couldn’t find that in our documents. Would you like to speak with a team member? "
+                "Say “I want to speak with someone.”")
     context = "\n\n".join([h[0] for h in hits])
-    # Simple compression: keep sentences that contain query keywords
     kws = [w for w in re.findall(r"[A-Za-z0-9]+", question.lower()) if len(w) > 3]
     sentences = re.split(r"(?<=[.!?])\s+", context)
     picked = []
@@ -152,26 +129,21 @@ def _compose_answer(question: str, hits: List[Tuple[str, str, float]]) -> str:
             picked.append(s.strip())
         if len(" ".join(picked)) > 700:
             break
-    answer = " ".join(picked).strip()
-    if not answer:
-        answer = sentences[0].strip()
-    # Keep it concise
+    answer = " ".join(picked).strip() or (sentences[0].strip() if sentences else "")
     return textwrap.shorten(answer, width=800, placeholder="…")
 
 def answer_question(question: str) -> str:
     kb: KB | None = st.session_state.get("kb_obj")
     if not kb:
-        # Try load from disk on first query
         kb = _load_index_if_exists()
         if kb:
             st.session_state.kb_obj = kb
             st.session_state.kb_ready = True
     if not kb:
-        return ("The knowledge base isn’t loaded yet. Go to Admin → upload PDFs, then ask again.")
+        return "The knowledge base isn’t loaded yet. Go to Admin → upload PDFs, then ask again."
     hits = _retrieve(kb, question, k=4)
     ans = _compose_answer(question, hits)
     if st.session_state.show_sources and hits:
-        # Append compact sources
         unique = []
         for _, src, _ in hits:
             if src not in unique:
@@ -179,7 +151,7 @@ def answer_question(question: str) -> str:
         ans += "\n\n_sources: " + ", ".join(unique[:4])
     return ans
 
-# ------------- Calendly handoff UI -------------
+# ---------- Calendly handoff ----------
 def show_manager_slots():
     tz = pytz.timezone(CALENDLY_TZ)
     now = dt.datetime.now(tz)
@@ -229,11 +201,10 @@ def show_manager_slots():
     else:
         st.warning("Calendly not configured. Add CALENDLY_EVENT_TYPE or CALENDLY_URL in secrets.")
 
-# ------------- Sidebar (options + admin) -------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.toggle("Show sources", value=st.session_state.show_sources, key="show_sources")
     st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
-
     st.markdown("---")
     if not st.session_state.is_admin:
         with st.popover("Admin mode"):
@@ -249,11 +220,11 @@ with st.sidebar:
         if st.button("Log out"):
             st.session_state.is_admin = False
 
-# ------------- Header -------------
+# ---------- Header ----------
 st.title(f"{STUDIO_NAME} Customer Support")
 st.caption("Ask about classes, schedules, childcare, pricing, promotions, and more.")
 
-# ------------- Admin panel -------------
+# ---------- Admin panel ----------
 if st.session_state.is_admin:
     st.subheader("Admin · Load / replace knowledge base (PDF/Text)")
     uploaded = st.file_uploader(
@@ -283,26 +254,20 @@ if st.session_state.is_admin:
                 st.warning("No saved index found yet.")
     st.markdown("---")
 
-# ------------- Helper: one-turn dispatcher -------------
+# ---------- Turn handler ----------
 def handle_turn(user_text: str):
     if not user_text:
         return
     st.chat_message("user").write(user_text)
-
-    # Human handoff
     if wants_handoff(user_text):
         show_manager_slots()
         return
-
-    # Answer from KB
     ans = answer_question(user_text)
     st.chat_message("assistant").write(ans)
-
-    # Simple lead capture hook (optional): detect interest keywords
     if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition)\b", user_text, re.I):
         with st.expander("Leave your info for a follow-up (optional)"):
             with st.form(f"lead_{int(time.time())}"):
-                name = st.text_input("Name")
+                name  = st.text_input("Name")
                 email = st.text_input("Email")
                 phone = st.text_input("Phone (optional)")
                 submitted = st.form_submit_button("Send to team")
@@ -313,13 +278,11 @@ def handle_turn(user_text: str):
                     except Exception:
                         st.info("Saved locally. (Lead sheet not configured.)")
 
-# ------------- Chat UI -------------
-# Restore prior messages (optional)
+# ---------- Chat UI ----------
 for role, msg in st.session_state.chat_history:
     st.chat_message(role).write(msg)
 
 user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)") or ""
 if user_msg:
     st.session_state.chat_history.append(("user", user_msg))
-    # The assistant messages are rendered inside handle_turn, but for history, capture a placeholder
     handle_turn(user_msg)
