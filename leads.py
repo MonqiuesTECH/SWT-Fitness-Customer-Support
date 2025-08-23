@@ -12,7 +12,6 @@ except Exception:
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def _get_ws():
-    """Return the Google Sheet worksheet or None if not configured."""
     try:
         sa_json = st.secrets.get("GOOGLE_SA_JSON")
         sheet_id = st.secrets.get("LEADS_SHEET_ID")
@@ -25,11 +24,9 @@ def _get_ws():
         return None
 
 def add_lead(name: str, email: str, phone: str, interest: str, source: str = "web") -> bool:
-    """Append a lead row. Returns True if written to Google Sheets, False if stored locally."""
     ts = dt.datetime.now().isoformat(timespec="seconds")
     ws = _get_ws()
     if ws is None:
-        # Fallback: hold locally so the app never crashes
         st.session_state.setdefault("leads_local", []).append([ts, name, email, phone, interest, source])
         return False
     ws.append_row([ts, name, email, phone, interest, source], value_input_option="USER_ENTERED")
