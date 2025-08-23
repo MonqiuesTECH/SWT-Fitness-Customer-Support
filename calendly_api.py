@@ -1,10 +1,8 @@
-# calendly_api.py
-# Minimal Calendly client with UTC time formatting + diagnostics helpers.
+# calendly_api.py — minimal Calendly client (UTC formatting + diagnostics)
 
 from __future__ import annotations
 import datetime as dt
 from typing import Dict, Any, List, Optional
-
 import requests
 import streamlit as st
 
@@ -20,7 +18,6 @@ def _headers(pat: Optional[str] = None) -> Dict[str, str]:
     return {"Authorization": f"Bearer {_pat(pat)}", "Accept": "application/json"}
 
 def _to_utc_z(t: dt.datetime) -> str:
-    # Calendly expects ISO8601 in UTC; pass timezone separately via "timezone" param
     if t.tzinfo is None:
         t = t.replace(tzinfo=dt.timezone.utc)
     t_utc = t.astimezone(dt.timezone.utc)
@@ -31,7 +28,7 @@ def _to_utc_z(t: dt.datetime) -> str:
 def whoami(pat: Optional[str] = None) -> Dict[str, Any]:
     r = requests.get(f"{API}/users/me", headers=_headers(pat), timeout=20)
     r.raise_for_status()
-    return r.json()["resource"]  # has 'uri', 'current_organization', etc.
+    return r.json()["resource"]
 
 def list_event_types(user_uri: str, pat: Optional[str] = None) -> List[Dict[str, Any]]:
     r = requests.get(f"{API}/event_types", headers=_headers(pat), params={"user": user_uri}, timeout=20)
