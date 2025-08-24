@@ -2,7 +2,7 @@
 # - PDF/Text RAG using pypdf + TF-IDF (scikit-learn)
 # - Admin upload + reindex
 # - Human handoff via Calendly API slot buttons
-# - Optional lead capture to Google Sheets (leads.py)
+# - Lead capture to Google Sheets (asks name/email/phone on arrival; uses leads.py)
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import joblib
 
 from intents import wants_handoff
 from calendly_api import list_available_times, create_single_use_link
-from leads import add_lead  # optional; safe to ignore if not configured
+from leads import add_lead  # safe: falls back to local queue if Sheets not configured
 
 # ---------- Page & secrets ----------
 st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💬", layout="wide")
@@ -29,8 +29,8 @@ st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💬", 
 STUDIO_NAME = st.secrets.get("STUDIO_NAME", "SWT Fitness")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 
-CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
-CALENDLY_URL = st.secrets.get("CALENDLY_URL", "").strip()
+CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()  # API URI (preferred, shows buttons)
+CALENDLY_URL = st.secrets.get("CALENDLY_URL", "").strip()                # Public URL (fallback link)
 CALENDLY_TZ = st.secrets.get("CALENDLY_TZ", "America/New_York")
 
 DATA_DIR  = "/mnt/data"
@@ -48,6 +48,10 @@ if "show_sources" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list[(role, text)]
 
+# Lead gate state
+st.session_state.setdefault("lead_captured", False)
+st.session_state.setdefault("lead_profile", {})
+
 # ---------- KB structures ----------
 @dataclass
 class KB:
@@ -60,9 +64,10 @@ def _chunk(text: str, chunk_size: int = 500, overlap: int = 120) -> List[str]:
     words = text.split()
     if not words: return []
     out, i = [], 0
+    step = max(1, chunk_size - overlap)
     while i < len(words):
         out.append(" ".join(words[i:i+chunk_size]))
-        i += (chunk_size - overlap)
+        i += step
     return out
 
 def _read_pdf(file: io.BytesIO) -> str:
@@ -254,16 +259,65 @@ if st.session_state.is_admin:
                 st.warning("No saved index found yet.")
     st.markdown("---")
 
+# ---------- Lead gate (ask contact info on arrival) ----------
+def lead_gate():
+    """Show a one-time lead capture prompt when the user lands."""
+    if st.session_state.lead_captured:
+        return
+
+    st.chat_message("assistant").write(
+        "Can I get your **name**, **email**, and **phone** so we can follow up?"
+    )
+
+    with st.form("lead_gate_form", clear_on_submit=False, enter_to_submit=True):
+        c1, c2 = st.columns(2)
+        name  = c1.text_input("Name *")
+        email = c2.text_input("Email *")
+        phone = st.text_input("Phone (optional)")
+        agree = st.checkbox("I agree to be contacted about my inquiry.")
+        colA, colB = st.columns([1,1])
+        submit = colA.form_submit_button("Send")
+        skip   = colB.form_submit_button("Skip for now")
+
+        if submit:
+            if not (name and email):
+                st.warning("Name and email are required.")
+            elif not agree:
+                st.warning("Please check the consent box so we can contact you.")
+            else:
+                try:
+                    ok = add_lead(name, email, phone, interest="Chat welcome", source="chat")
+                    if ok:
+                        st.success("Thanks! You’re all set. We’ll follow up if needed.")
+                    else:
+                        st.info("Saved locally. We’ll sync to Google Sheets when connected.")
+                except Exception:
+                    st.info("Saved locally. (Lead store not configured yet.)")
+
+                st.session_state.lead_captured = True
+                st.session_state.lead_profile = {"name": name, "email": email, "phone": phone}
+
+        if skip and not st.session_state.lead_captured:
+            st.session_state.lead_captured = True
+            st.session_state.lead_profile = {}
+            st.info("No problem — you can still ask questions anytime.")
+
 # ---------- Turn handler ----------
 def handle_turn(user_text: str):
     if not user_text:
         return
     st.chat_message("user").write(user_text)
+
+    # Human handoff if requested
     if wants_handoff(user_text):
         show_manager_slots()
         return
+
+    # Answer from KB
     ans = answer_question(user_text)
     st.chat_message("assistant").write(ans)
+
+    # Lightweight lead hook when user shows buying intent
     if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition)\b", user_text, re.I):
         with st.expander("Leave your info for a follow-up (optional)"):
             with st.form(f"lead_{int(time.time())}"):
@@ -273,14 +327,21 @@ def handle_turn(user_text: str):
                 submitted = st.form_submit_button("Send to team")
                 if submitted and name and email:
                     try:
-                        add_lead(name, email, phone, interest="From chat", source="web")
-                        st.success("Thanks! We’ll follow up shortly.")
+                        ok = add_lead(name, email, phone, interest="From chat", source="web")
+                        if ok:
+                            st.success("Thanks! We’ll follow up shortly.")
+                        else:
+                            st.info("Saved locally. (Lead sheet not configured.)")
                     except Exception:
-                        st.info("Saved locally. (Lead sheet not configured.)")
+                        st.info("Saved locally. (Lead store not configured.)")
 
 # ---------- Chat UI ----------
+# Replay prior messages (optional)
 for role, msg in st.session_state.chat_history:
     st.chat_message(role).write(msg)
+
+# Ask for contact details once on arrival
+lead_gate()
 
 user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)") or ""
 if user_msg:
