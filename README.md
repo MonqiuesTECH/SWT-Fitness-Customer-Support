@@ -1,5 +1,7 @@
 SWT Fitness – Customer Support Bot (Streamlit)
 
+https://www.loom.com/share/9b29a521131946c1b2683b7773eda4fd?sid=0a679102-61cb-4069-abaa-4353d0987e6a
+
 A lightweight, free-tier friendly customer support assistant for a women’s gym.
 Built with Streamlit, TF-IDF RAG (no paid LLM APIs), Calendly handoff, and Google Sheets lead capture.
 
