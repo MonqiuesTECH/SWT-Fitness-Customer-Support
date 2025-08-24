@@ -1,0 +1,89 @@
+ZARI PROPRIETARY SOFTWARE LICENSE (NO PAY, NO PLAY)
+
+Version 1.0 – Effective: [Augest 24, 2025]
+Licensor: ZARI (“Licensor”)
+Software: SWT Fitness Customer Support Bot (the “Software”), including source, binaries, configs, and documentation.
+
+By downloading, deploying, or using the Software, you (“Licensee”) agree to this License.
+
+1. Grant of License
+
+Subject to full and timely payment of all fees and continuous compliance with this License, Licensor grants Licensee a limited, non-exclusive, non-transferable, revocable license to install and run the Software for Licensee’s internal business purposes only. Unless otherwise agreed in writing, the license is limited to one (1) production instance serving a single organization.
+
+2. “No Pay, No Play” – Fees & Activation
+
+This license is expressly conditioned on full, timely payment of all applicable fees. If any amount is unpaid or reversed (e.g., chargeback), this License automatically suspends and Licensor may disable access (including keys/tokens) without notice. Reinstatement requires payment of all past due amounts plus any applicable reactivation fees.
+
+3. Restrictions (Read Carefully)
+
+Licensee shall not (nor permit any third party to):
+
+copy, distribute, sublicense, sell, host, rent, or provide the Software as a service to others;
+
+modify, translate, reverse engineer, decompile, disassemble, or create derivative works, except to the extent a right cannot be restricted by law;
+
+remove, hide, or alter attribution or proprietary notices, including the “Powered by ZARI” requirement (Section 4);
+
+use the Software to build or train any AI/ML model, dataset, or derivative system (including via prompts, logs, or outputs);
+
+publish benchmarks, performance tests, or security assessments without Licensor’s prior written consent;
+
+use the Software to operate or assist a competing service or to support more instances/locations than licensed;
+
+circumvent technical limitations, rate limits, or license controls.
+
+4. Required Attribution – “Powered by ZARI”
+
+Licensee must display “Powered by ZARI” in a reasonably visible location in the user interface (e.g., footer or sidebar) and retain the same in any About/Help section and README. Attribution must remain visible in all deployments. Removal or obscuring of attribution is a material breach.
+
+5. Updates; Support
+
+Licensor may provide updates or patches at its discretion. Unless a separate support agreement exists, the Software is provided without support, SLAs, or uptime guarantees.
+
+6. Data & Privacy
+
+Licensee owns its own business data. Licensor may process diagnostic/usage data solely to provide the Software, enforce this License, and improve security. Licensor will not use Licensee content to train Licensor’s models without Licensee’s written consent.
+
+7. Confidentiality; Keys
+
+All license keys, tokens, documentation, and non-public information are Confidential Information. Licensee shall protect them with at least reasonable care and not disclose them except to employees/contractors with a need to know and bound by confidentiality obligations.
+
+8. Compliance & Audit
+
+Upon 5 business days’ notice, Licensee shall provide reasonable information/logs to verify compliance (instance count, domains, users). If an audit reveals under-licensing, Licensee must promptly purchase the required licenses and pay any related fees.
+
+9. Term & Termination
+
+This License continues until terminated. Licensor may terminate immediately upon non-payment, material breach, or misuse. Upon termination, all rights cease and Licensee must stop using and delete all copies of the Software and keys. Sections 2–4, 6–13 survive termination.
+
+10. Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED “AS IS” AND “AS AVAILABLE,” WITH NO WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, OR ERROR-FREE OR UNINTERRUPTED OPERATION.
+
+11. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR SHALL NOT BE LIABLE FOR ANY INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL. LICENSOR’S TOTAL AGGREGATE LIABILITY ARISING OUT OF OR RELATED TO THE SOFTWARE SHALL NOT EXCEED THE AMOUNTS ACTUALLY PAID BY LICENSEE FOR THE SOFTWARE IN THE TWELVE (12) MONTHS PRECEDING THE CLAIM.
+
+12. Indemnity
+
+Licensee shall defend, indemnify, and hold harmless Licensor from any third-party claims, damages, liabilities, costs, and expenses (including reasonable attorneys’ fees) arising from Licensee’s use of the Software, violation of this License, or violation of law.
+
+13. High-Risk Use
+
+The Software is not designed for medical, life-support, emergency, critical infrastructure, or other high-risk activities. Licensee assumes all risk for such use.
+
+14. Government; Export
+
+The Software is commercial computer software. Licensee agrees to comply with all export and sanctions laws and will not export or allow access contrary to U.S. or other applicable law.
+
+15. Governing Law; Venue; Injunctive Relief
+
+This License is governed by the laws of the State of Maryland, USA, without regard to conflicts of laws. Exclusive venue lies in state or federal courts located in Maryland, and the parties consent to personal jurisdiction there. Breach of Sections 3–4, 7–8 will cause irreparable harm; Licensor is entitled to injunctive relief in addition to other remedies.
+
+16. Miscellaneous
+
+This is the entire agreement regarding the Software and supersedes all prior or contemporaneous understandings. Any assignment by Licensee without Licensor’s consent is void. If any provision is unenforceable, the remainder will remain in effect. No waiver is implied by any delay or failure to enforce.
+
+ALL RIGHTS RESERVED.
+For commercial licensing, additional instances, or written exceptions, contact: legal@zari.ai
+ (or your ZARI representative).
