@@ -1,14 +1,8 @@
-# app.py — SWT Fitness Customer Support (Pro UI, free stack)
-# - Polished UI (header + chips + bubbles) + "Powered by ZARI"
-# - Admin toggle at top (login + PDF KB upload + knobs)
-# - PDF/Text RAG (TF-IDF) with concise answers (no copy-paste walls)
-# - Guided dialogs: Membership (price range → frequency → plan) & Schedule (day → time → classes)
-# - Human handoff via Calendly (public link)
-# - Optional lead capture to Google Sheets (leads.py), safe to omit
+# app.py — Pro chat UI, safe KB loading, null-safe flows, Calendly handoff,
+# lead capture, and “Powered by ZARI” footer.
 
 from __future__ import annotations
-
-import os, io, re, json, time, textwrap, datetime as dt
+import io, os, json, re, time, textwrap, datetime as dt
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any
 
@@ -21,160 +15,60 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import joblib
 
-# ---------- Optional leads (safe no-op if file absent) ----------
-try:
-    from leads import add_lead  # expects add_lead(name, email, phone, interest, source)
-except Exception:
-    def add_lead(*args, **kwargs):
-        pass  # no-op if not configured
+from intents import detect_intent, wants_handoff
+from calendly_api import list_available_times, create_single_use_link
+from leads import add_lead  # optional; safe if not configured
 
+# ---------------------- Page / Theme ----------------------
+st.set_page_config(
+    page_title="SWT Fitness Customer Support",
+    page_icon="💬",
+    layout="wide",
+)
 
-# ================================================================
-# Configuration (secrets with sane defaults)
-# ================================================================
-st.set_page_config(page_title="SWT Fitness — Customer Support", page_icon="💬", layout="wide")
+# Inject a cleaner “widget-style” look
+st.markdown("""
+<style>
+/* tighter body + nicer chat bubbles */
+.main .block-container {padding-top: 1rem; padding-bottom: 3rem; max-width: 980px;}
+.stChatMessage .stMarkdown p {margin: 0.25rem 0;}
+/* CTA buttons inside expander */
+a.slot-btn{
+  display:inline-block;margin:6px 8px;padding:10px 14px;border-radius:12px;
+  border:1px solid #e5e7eb;text-decoration:none;font-weight:600;
+}
+.small-note{font:600 12px/1.3 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; opacity:.7}
+.zari-footer{margin-top:18px; padding-top:10px; border-top:1px dashed #e5e7eb; text-align:center;}
+</style>
+""", unsafe_allow_html=True)
 
-STUDIO_NAME     = st.secrets.get("STUDIO_NAME", "SWT Fitness")
-ADMIN_PASSWORD  = st.secrets.get("ADMIN_PASSWORD", "SWT_2025!manager")
-UNKNOWN_MESSAGE = st.secrets.get("UNKNOWN_MESSAGE", "I'm not sure — would you like to speak with the manager?")
-MIN_SIMILARITY  = float(st.secrets.get("MIN_SIMILARITY", 0.12))
-CALENDLY_URL    = st.secrets.get("CALENDLY_URL", "").strip()
-CALENDLY_TZ     = st.secrets.get("CALENDLY_TZ", "America/New_York")
+# ---------------------- Secrets ----------------------
+STUDIO_NAME       = st.secrets.get("STUDIO_NAME", "SWT Fitness")
+ADMIN_PASSWORD    = st.secrets.get("ADMIN_PASSWORD", "admin")
+CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
+CALENDLY_URL        = st.secrets.get("CALENDLY_URL", "").strip()
+CALENDLY_TZ         = st.secrets.get("CALENDLY_TZ", "America/New_York")
 
-# Branding (for Pro UI)
-BRAND_COLOR     = st.secrets.get("BRAND_COLOR", "#0D7AFF")
-AVATAR_LETTER   = st.secrets.get("AVATAR_LETTER", (STUDIO_NAME or "SWT")[0:1].upper())
-AVATAR_BG       = st.secrets.get("AVATAR_BG", "#ffffff")
-
-# Storage (Streamlit Cloud is writable at /tmp)
-DATA_DIR  = st.secrets.get("DATA_DIR", "/tmp")
+DATA_DIR  = "/mnt/data"
 VEC_PATH  = os.path.join(DATA_DIR, "kb_vectorizer.joblib")
 MAT_PATH  = os.path.join(DATA_DIR, "kb_matrix.joblib")
 META_PATH = os.path.join(DATA_DIR, "kb_meta.json")
 
-# ================================================================
-# Session State
-# ================================================================
-if "is_admin" not in st.session_state:
-    st.session_state.is_admin = False
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history: List[Tuple[str, str]] = []
-if "flow" not in st.session_state:
-    st.session_state.flow = None  # "membership" | "schedule" | None
-if "slots" not in st.session_state:
-    st.session_state.slots = {}   # store dialog slots (e.g., freq, day, time)
-if "kb_ready" not in st.session_state:
-    st.session_state.kb_ready = False
+# ---------------------- Session ----------------------
+ss = st.session_state
+if "is_admin" not in ss:          ss.is_admin = False
+if "kb_ready" not in ss:          ss.kb_ready = False
+if "show_sources" not in ss:      ss.show_sources = True
+if "chat_history" not in ss:      ss.chat_history = []  # list[(role, text)]
+if "membership_map" not in ss:    ss.membership_map = {}
+if "sched_step" not in ss:        ss.sched_step = None
+if "sched_day" not in ss:         ss.sched_day = None
 
-# ================================================================
-# Pro UI CSS + Header (with "Powered by ZARI")
-# ================================================================
-PRO_UI_CSS = f"""
-<style>
-#MainMenu, header, footer {{ display: none !important; }}
-section.main > div {{ padding-top: .5rem; }}
-.block-container {{ padding-top: .75rem; max-width: 840px; }}
-
-/* Brand header */
-.z-header {{
-  position: sticky; top: 0; z-index: 10;
-  display:flex; align-items:center; justify-content:space-between; gap:.75rem;
-  padding: .75rem 1rem; border-radius: 14px;
-  background: linear-gradient(180deg, rgba(13,122,255,.10), rgba(13,122,255,.04));
-  border: 1px solid rgba(13,122,255,.20);
-  backdrop-filter: blur(4px);
-  margin-bottom: .5rem;
-}}
-.z-left {{ display:flex; align-items:center; gap:.75rem; }}
-.z-avatar {{
-  width:32px; height:32px; border-radius:50%;
-  display:grid; place-items:center; font-weight:800;
-  color: {BRAND_COLOR}; background:{AVATAR_BG};
-  box-shadow: 0 2px 8px rgba(0,0,0,.08);
-}}
-.z-title {{ font-weight:700; font-size:15px }}
-.z-sub   {{ opacity:.7; font-size:13px }}
-
-/* "Powered by ZARI" tag */
-.z-tag {{
-  display:inline-block; padding:6px 10px; border-radius:999px;
-  border:1px solid rgba(13,122,255,.25); color:{BRAND_COLOR}; background:#fff;
-  font: 700 12px/1 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  text-decoration:none;
-}}
-
-/* Message bubbles */
-[data-testid="stChatMessage"] {{ background: transparent !important; }}
-/* assistant bubble */
-[data-testid="stChatMessage"]:has([data-testid="stMarkdownContainer"]) div[role="document"] {{
-  border: 1px solid #ececec; border-radius: 14px; padding: 10px 12px;
-  box-shadow: 0 6px 16px rgba(0,0,0,.05); background:#fff;
-}}
-/* user bubble */
-[data-testid="stChatMessage"] div[role="document"]:has(.user-bubble) {{
-  background: {BRAND_COLOR}; color: #fff; border: 0 !important;
-}}
-.user-bubble p {{ color:#fff !important; }}
-
-/* Chips row */
-.z-chips {{ display:flex; flex-wrap:wrap; gap:8px; margin: .25rem 0 .5rem; }}
-.z-chip  {{ border:1px solid #e6e6e8; border-radius:999px; padding:8px 12px; background:#fff;
-           cursor:pointer; font-size:13px; transition:all .15s ease; user-select:none; }}
-.z-chip:hover {{ border-color:{BRAND_COLOR}; box-shadow:0 4px 12px rgba(13,122,255,.15); }}
-
-/* Top admin bar */
-.z-adminbar {{ display:flex; align-items:center; gap:12px; margin: 6px 2px 10px; }}
-.z-foot {{ text-align:center; font-size:12px; opacity:.55; margin:10px 0 6px; }}
-</style>
-"""
-st.markdown(PRO_UI_CSS, unsafe_allow_html=True)
-
-st.markdown(
-    f"""
-    <div class="z-header">
-      <div class="z-left">
-        <div class="z-avatar">{AVATAR_LETTER}</div>
-        <div>
-          <div class="z-title">{STUDIO_NAME} — Customer Support</div>
-          <div class="z-sub">Ask about memberships, schedule, childcare, promotions, and more.</div>
-        </div>
-      </div>
-      <div class="z-right">
-        <a class="z-tag" href="https://zari.ai" target="_blank" rel="noopener">Powered by ZARI</a>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Top admin toggle / login
-c1, c2, c3 = st.columns([1.2, 1, 1])
-with c1:
-    admin_toggle = st.toggle("Admin mode", value=st.session_state.is_admin, key="admin_toggle", help="Login to upload PDFs and tweak settings")
-with c2:
-    pass
-with c3:
-    st.caption("")
-
-if admin_toggle and not st.session_state.is_admin:
-    pw = st.text_input("Enter admin password", type="password")
-    if st.button("Log in", type="primary"):
-        if pw == ADMIN_PASSWORD:
-            st.session_state.is_admin = True
-            st.success("Admin mode enabled.")
-        else:
-            st.error("Wrong password.")
-elif not admin_toggle and st.session_state.is_admin:
-    st.session_state.is_admin = False
-    st.info("Admin mode disabled.")
-
-# ================================================================
-# KB: Chunk / Index / Cache
-# ================================================================
+# ---------------------- KB structures ----------------------
 @dataclass
 class KB:
     vectorizer: TfidfVectorizer
-    matrix: Any
+    matrix: Any  # sparse
     chunks: List[str]
     sources: List[str]
 
@@ -184,7 +78,7 @@ def _chunk(text: str, chunk_size: int = 500, overlap: int = 120) -> List[str]:
     out, i = [], 0
     while i < len(words):
         out.append(" ".join(words[i:i+chunk_size]))
-        i += max(1, (chunk_size - overlap))
+        i += max(1, chunk_size - overlap)
     return out
 
 def _read_pdf(file: io.BytesIO) -> str:
@@ -192,367 +86,330 @@ def _read_pdf(file: io.BytesIO) -> str:
     reader = PdfReader(file)
     for page in reader.pages:
         t = page.extract_text() or ""
-        if t:
-            text.append(t)
+        if t: text.append(t)
     return "\n".join(text)
 
 def _build_index(from_files: List[io.BytesIO], filenames: List[str]) -> KB:
-    all_chunks: List[str] = []
-    sources: List[str] = []
+    all_chunks, sources = [], []
     for file, name in zip(from_files, filenames):
         file.seek(0)
         txt = _read_pdf(file)
-        for ch in _chunk(txt, 520, 140):
-            all_chunks.append(ch)
-            sources.append(name)
-
+        for ch in _chunk(txt, 500, 120):
+            all_chunks.append(ch); sources.append(name)
     vectorizer = TfidfVectorizer(ngram_range=(1,2), max_features=50000, lowercase=True)
     matrix = vectorizer.fit_transform(all_chunks)
-
     os.makedirs(DATA_DIR, exist_ok=True)
     joblib.dump(vectorizer, VEC_PATH)
     joblib.dump(matrix, MAT_PATH)
     with open(META_PATH, "w") as f:
         json.dump({"chunks": all_chunks, "sources": sources}, f)
-
     return KB(vectorizer=vectorizer, matrix=matrix, chunks=all_chunks, sources=sources)
 
-@st.cache_resource(show_spinner=False)
-def cached_load_index() -> KB | None:
+def _load_index_if_exists() -> KB | None:
     try:
         if not (os.path.exists(VEC_PATH) and os.path.exists(MAT_PATH) and os.path.exists(META_PATH)):
             return None
         vectorizer = joblib.load(VEC_PATH)
         matrix = joblib.load(MAT_PATH)
         meta = json.load(open(META_PATH))
-        return KB(vectorizer=vectorizer, matrix=matrix,
-                  chunks=meta["chunks"], sources=meta["sources"])
+        return KB(vectorizer=vectorizer, matrix=matrix, chunks=meta["chunks"], sources=meta["sources"])
     except Exception:
         return None
 
-# Warm on boot
-if "kb_obj" not in st.session_state:
-    st.session_state.kb_obj = cached_load_index()
-    st.session_state.kb_ready = bool(st.session_state.kb_obj)
+def get_kb():
+    """Lazy-load the KB from disk on first use."""
+    kb = ss.get("kb_obj")
+    if kb: return kb
+    kb = _load_index_if_exists()
+    if kb:
+        ss.kb_obj = kb
+        ss.kb_ready = True
+    return kb
 
-# ================================================================
-# Retrieval + Answer composition (concise, no wall-of-text)
-# ================================================================
 def _retrieve(kb: KB, query: str, k: int = 4) -> List[Tuple[str, str, float]]:
     qv = kb.vectorizer.transform([query])
     sims = cosine_similarity(qv, kb.matrix).ravel()
     idx = np.argsort(-sims)[:k]
-    out = [(kb.chunks[i], kb.sources[i], float(sims[i])) for i in idx]
-    return out
+    return [(kb.chunks[i], kb.sources[i], float(sims[i])) for i in idx]
 
-def _best_snippets(question: str, hits: List[Tuple[str, str, float]], limit_chars=600) -> str:
-    # Pull short sentences relevant to question keywords
+def _compose_answer(question: str, hits: List[Tuple[str, str, float]], min_conf: float = 0.08) -> str:
+    if not hits or (hits[0][2] < min_conf):
+        return ""
+    context = "\n\n".join([h[0] for h in hits])
+    # extract a few relevant sentences rather than dump text
     kws = [w for w in re.findall(r"[A-Za-z0-9]+", question.lower()) if len(w) > 3]
-    sentences = []
-    for chunk, _, _ in hits:
-        for s in re.split(r"(?<=[.!?])\s+", chunk):
-            ls = s.lower()
-            if any(k in ls for k in kws):
-                sentences.append(s.strip())
-    if not sentences and hits:
-        sentences = re.split(r"(?<=[.!?])\s+", hits[0][0])[:3]
-    ans = " ".join(sentences)
-    return textwrap.shorten(ans.strip(), width=limit_chars, placeholder="…")
+    sents = re.split(r"(?<=[.!?])\s+", context)
+    picked = []
+    for s in sents:
+        ls = s.lower()
+        if any(k in ls for k in kws) or len(picked) < 3:
+            picked.append(s.strip())
+        if len(" ".join(picked)) > 700: break
+    return textwrap.shorten(" ".join(picked).strip(), width=800, placeholder="…")
 
-def _compose_answer(question: str, kb: KB) -> Tuple[str, List[str], float]:
+def answer_question(question: str) -> str:
+    kb = get_kb()
+    if not kb:  # no index yet
+        return ""
     hits = _retrieve(kb, question, k=4)
-    if not hits:
-        return "", [], 0.0
-    best_sim = max(h[2] for h in hits)
-    concise = _best_snippets(question, hits)
-    srcs = []
-    for _, src, _ in hits:
-        if src not in srcs:
-            srcs.append(src)
-    return concise, srcs, best_sim
+    ans = _compose_answer(question, hits)
+    if not ans:
+        return ""
+    if ss.show_sources and hits:
+        unique = []
+        for _, src, _ in hits:
+            if src not in unique: unique.append(src)
+        ans += "\n\n" + f'<span class="small-note">sources: ' + ", ".join(unique[:4]) + "</span>"
+    return ans
 
-# ================================================================
-# Intents & Dialog helpers
-# ================================================================
-def wants_handoff(text: str) -> bool:
-    return bool(re.search(r"\b(speak|talk|human|person|manager|call|phone)\b", text, re.I))
-
-def parse_frequency(text: str) -> str | None:
-    t = text.lower()
-    if "unlimited" in t: return "unlimited"
-    words_map = {
-        r"\b(one|once|1)\b": "1",
-        r"\b(two|twice|2)\b": "2",
-        r"\b(three|3)\b": "3",
-        r"\b(four|4)\b": "4",
-        r"\b(five|5)\b": "5",
-        r"\b(six|6)\b": "6",
-        r"\b(seven|7)\b": "7",
-    }
-    for pat, val in words_map.items():
-        if re.search(pat, t):
-            return val
-    return None
-
-def price_range_from_kb(kb: KB) -> Tuple[str, str] | None:
-    # Look for $ amounts across chunks
-    amounts = []
+# ---------------------- Extraction helpers ----------------------
+def extract_memberships(kb: KB) -> Dict[str, Dict[str, Any]]:
+    """Very light parser for plan names + $prices."""
+    if kb is None: return {}
+    plans: Dict[str, Dict[str, Any]] = {}
+    price_re = re.compile(r"\$?\s*(\d{2,3}(?:\.\d{2})?)")
     for ch in kb.chunks:
-        for m in re.findall(r"\$\s*([0-9]+(?:\.[0-9]{2})?)", ch):
-            try: amounts.append(float(m))
-            except: pass
-    if not amounts: return None
-    lo, hi = min(amounts), max(amounts)
-    # Round "nice"
-    return (f"${lo:,.0f}" if lo.is_integer() else f"${lo:,.2f}",
-            f"${hi:,.0f}" if hi.is_integer() else f"${hi:,.2f}")
+        lower = ch.lower()
+        for name in ["sapphire","saphire","pearl","diamond","basic","standard","plus","premium","unlimited"]:
+            if name in lower:
+                m = price_re.search(ch)
+                price = float(m.group(1)) if m else None
+                title = name.capitalize()
+                plans.setdefault(title, {})["price"] = price
+                plans[title]["raw"] = ch
+    return plans
 
-def recommend_plan_by_freq(kb: KB, freq: str) -> str:
-    # Heuristic: pick sentences that mention freq or unlimited
-    q = "membership plan unlimited" if freq == "unlimited" else f"membership {freq} times per week plan"
-    hits = _retrieve(kb, q, k=4)
-    if not hits:
-        if freq == "unlimited":
-            return "Unlimited plan"
-        return f"{freq}x/week plan"
-    # extract a likely plan/tier name from hits
-    text = " ".join(h[0] for h in hits)
-    # look for capitalized tier-like words (Pearl, Gold, Unlimited, Basic, etc.)
-    tiers = re.findall(r"\b([A-Z][a-zA-Z]+(?:\s*&\s*[A-Z][a-zA-Z]+)?)\b", text)
-    # filter noise
-    tiers = [t for t in tiers if t.lower() not in {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}]
-    if tiers:
-        return tiers[0]
-    return "Recommended plan"
+def find_classes_for(kb: KB, day: str, when: str | None = None) -> List[str]:
+    """Heuristic: pull lines mentioning the day and show time + class names."""
+    if kb is None: return []
+    day_rx = re.compile(day, re.I)
+    time_rx = re.compile(r"\b(\d{1,2}[:.]?\d{0,2}\s?(?:am|pm))\b", re.I)
+    results = []
+    for ch in kb.chunks:
+        if not day_rx.search(ch): continue
+        # Split into lines and pick those with times
+        for line in ch.splitlines():
+            if day_rx.search(line) or time_rx.search(line):
+                results.append(line.strip())
+    # Deduplicate and clean
+    out, seen = [], set()
+    for r in results:
+        r = re.sub(r"\s{2,}", " ", r)
+        if r not in seen:
+            out.append(r); seen.add(r)
+    return out[:12]
 
-def parse_day(text: str) -> str | None:
-    days = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","today","tomorrow"]
-    for d in days:
-        if re.search(rf"\b{d}\b", text.lower()):
-            return d
-    return None
+# ---------------------- Calendly handoff ----------------------
+def show_manager_slots():
+    tz = pytz.timezone(CALENDLY_TZ)
+    now = dt.datetime.now(tz)
+    start, end = now, now + dt.timedelta(days=7)
+    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
 
-def parse_timewindow(text: str) -> str | None:
-    t = text.lower()
-    if re.search(r"\b(morning|am|a\.m\.)\b", t): return "morning"
-    if re.search(r"\b(afternoon)\b", t): return "afternoon"
-    if re.search(r"\b(evening|pm|p\.m\.)\b", t): return "evening"
-    # specific times (e.g., 6:00, 6pm)
-    m = re.search(r"\b([0-1]?\d)(?::([0-5]\d))?\s*(am|pm)?\b", t)
-    if m:
-        hr = int(m.group(1)); mer = (m.group(3) or "").lower()
-        if mer == "am" and 5 <= hr <= 11: return "morning"
-        if mer == "pm" and 12 <= hr <= 16: return "afternoon"
-        if mer == "pm" and 16 <= hr <= 22: return "evening"
-    return None
+    if CALENDLY_EVENT_TYPE:
+        try:
+            slots = list_available_times(CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
+        except Exception:
+            st.error("Scheduler temporarily unavailable.")
+            if CALENDLY_URL:
+                st.write(f'<a class="slot-btn" href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+            return
 
-def show_manager_link():
+        if not slots:
+            st.info("No open slots in the next 7 days.")
+            try:
+                url = create_single_use_link(CALENDLY_EVENT_TYPE)
+                st.write(f'<a class="slot-btn" href="{url}" target="_blank" rel="noopener">See more dates</a>', unsafe_allow_html=True)
+            except Exception:
+                if CALENDLY_URL:
+                    st.write(f'<a class="slot-btn" href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+            return
+
+        from collections import defaultdict
+        by_day = defaultdict(list)
+        for s in slots:
+            t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
+            by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
+
+        for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
+            with st.expander(day, expanded=len(by_day) == 1):
+                for t, url in entries:
+                    label = t.strftime("%-I:%M %p")
+                    st.write(f'<a class="slot-btn" href="{url}" target="_blank" rel="noopener">Book {label}</a>', unsafe_allow_html=True)
+        return
+
     if CALENDLY_URL:
+        st.write(f'<a class="slot-btn" href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+    else:
+        st.warning("Calendly not configured. Add CALENDLY_EVENT_TYPE or CALENDLY_URL in secrets.")
+
+# ---------------------- Sidebar ----------------------
+with st.sidebar:
+    st.toggle("Show sources", value=ss.show_sources, key="show_sources")
+    st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
+    st.markdown("---")
+    if not ss.is_admin:
+        with st.popover("Admin mode"):
+            pw = st.text_input("Password", type="password")
+            if st.button("Log in"):
+                if pw == ADMIN_PASSWORD:
+                    ss.is_admin = True
+                    st.success("Admin mode enabled.")
+                else:
+                    st.error("Wrong password.")
+    else:
+        st.success("Admin mode")
+        if st.button("Log out"):
+            ss.is_admin = False
+
+# ---------------------- Header ----------------------
+st.title(f"{STUDIO_NAME} Customer Support")
+st.caption("Ask about classes, schedules, childcare, pricing, promotions, and more.")
+
+# ---------------------- Admin: upload / load KB ----------------------
+if ss.is_admin:
+    st.subheader("Admin · Load / replace knowledge base (PDF/Text)")
+    uploaded = st.file_uploader(
+        "Upload one or more PDFs (membership pricing, policies, schedule, childcare).",
+        type=["pdf"], accept_multiple_files=True,
+    )
+    col1, col2 = st.columns([1,1])
+    with col1:
+        if st.button("Build/Replace knowledge base", type="primary", use_container_width=True, disabled=(not uploaded)):
+            with st.spinner("Indexing documents…"):
+                kb = _build_index(
+                    from_files=[io.BytesIO(f.read()) for f in uploaded],
+                    filenames=[f.name for f in uploaded],
+                )
+                ss.kb_obj = kb
+                ss.kb_ready = True
+                ss.membership_map = {}  # reset caches
+                ss.sched_step = None; ss.sched_day = None
+            st.success(f"Indexed {len(kb.chunks)} chunks from {len(set(kb.sources))} file(s).")
+    with col2:
+        if st.button("Load existing index from disk", use_container_width=True):
+            kb = _load_index_if_exists()
+            if kb:
+                ss.kb_obj = kb
+                ss.kb_ready = True
+                st.success(f"Loaded {len(kb.chunks)} chunks from disk.")
+            else:
+                st.warning("No saved index found yet.")
+    st.markdown("---")
+
+# ---------------------- Conversational Flows ----------------------
+def _kb_not_ready_msg():
+    st.chat_message("assistant").write("I don't know — would you like to speak with our manager?")
+    show_manager_slots()
+
+def membership_flow(user_text: str, kb: KB | None):
+    if kb is None or not getattr(kb, "chunks", None):
+        _kb_not_ready_msg(); return
+    if not ss.membership_map:
+        ss.membership_map = extract_memberships(kb)
+
+    mm = ss.membership_map or {}
+    prices = [float(v["price"]) for v in mm.values() if v.get("price") is not None]
+    if prices:
+        lo, hi = min(prices), max(prices)
         st.chat_message("assistant").write(
-            f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>',
-            unsafe_allow_html=True
+            f"Our memberships range from **${lo:,.2f}–${hi:,.2f}**. "
+            "How many days per week do you want to work out?"
         )
     else:
-        st.chat_message("assistant").write("Our manager will follow up shortly.")
+        _kb_not_ready_msg()
 
-# ================================================================
-# Answering + Dialog Controller
-# ================================================================
-def answer_question(question: str) -> str:
-    kb: KB | None = st.session_state.get("kb_obj") or cached_load_index()
-    if kb and not st.session_state.get("kb_obj"):
-        st.session_state.kb_obj = kb
-        st.session_state.kb_ready = True
-    if not kb:
-        return "The knowledge base isn’t loaded yet. Go to Admin → upload PDFs, then ask again."
+def schedule_flow(user_text: str, kb: KB | None):
+    if kb is None or not getattr(kb, "chunks", None):
+        _kb_not_ready_msg(); return
 
-    concise, _, best_sim = _compose_answer(question, kb)
-    if not concise or best_sim < MIN_SIMILARITY:
-        return f"{UNKNOWN_MESSAGE}"
-    return concise
+    # step 1: ask for day
+    if ss.sched_step is None:
+        ss.sched_step = "ask_day"
+        st.chat_message("assistant").write("Okay — what **day** would you like to work out? (e.g., Monday)")
+        return
 
+    # parse day from user
+    day_names = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    if ss.sched_step == "ask_day":
+        for d in day_names:
+            if re.search(fr"\b{d}\b", user_text, re.I):
+                ss.sched_day = d
+                ss.sched_step = "show"
+                break
+        if ss.sched_step != "show":
+            st.chat_message("assistant").write("Got it — which **day**? (e.g., Tuesday)")
+            return
+
+    # show matches
+    if ss.sched_step == "show" and ss.sched_day:
+        lines = find_classes_for(kb, ss.sched_day)
+        if not lines:
+            st.chat_message("assistant").write(
+                f"I don't know what's scheduled for **{ss.sched_day}**. Would you like to speak with our manager?"
+            )
+            show_manager_slots()
+        else:
+            st.chat_message("assistant").markdown(
+                f"**{ss.sched_day} — here’s what we have:**\n\n- " + "\n- ".join(lines)
+            )
+        # reset flow
+        ss.sched_step = None
+        ss.sched_day = None
+
+# ---------------------- Turn handler ----------------------
 def handle_turn(user_text: str):
     if not user_text: return
-    st.chat_message("user").markdown(f"<div class='user-bubble'>{user_text}</div>", unsafe_allow_html=True)
+    st.chat_message("user").write(user_text)
 
-    # Handoff intent always wins
+    kb = get_kb()  # try to load on demand
+
+    # manager handoff phrases
     if wants_handoff(user_text):
-        st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
-        show_manager_link()
-        return
+        show_manager_slots(); return
 
-    # Membership dialog
-    if st.session_state.flow == "membership" or re.search(r"\b(membership|join|sign\s*up)\b", user_text, re.I):
-        st.session_state.flow = "membership"
-        kb = st.session_state.get("kb_obj")
-        pr = price_range_from_kb(kb) if kb else None
-        freq = parse_frequency(user_text)
-        if "freq" not in st.session_state.slots and not freq:
-            if pr:
-                lo, hi = pr
-                st.chat_message("assistant").write(
-                    f"Our memberships range from **{lo}–{hi}**. How often do you want to work out each week? (2 / 3 / unlimited)"
-                )
-            else:
-                st.chat_message("assistant").write(
-                    "How often do you want to work out each week? (2 / 3 / unlimited)"
-                )
-            st.session_state.slots["freq"] = None
-            return
-        if freq:
-            st.session_state.slots["freq"] = freq
+    intent = detect_intent(user_text)
 
-        if st.session_state.slots.get("freq"):
-            plan = recommend_plan_by_freq(kb, st.session_state.slots["freq"])
-            # Compose concise recommendation; avoid raw copy/paste
-            extra = answer_question("membership benefits and included features")
-            msg = f"I recommend the **{plan}** based on going **{st.session_state.slots['freq']}x/week**."
-            if extra and extra != UNKNOWN_MESSAGE:
-                msg += f" {textwrap.shorten(extra, 160, placeholder='…')}"
-            st.chat_message("assistant").write(msg)
-            st.chat_message("assistant").write("Want to book a quick consult with our manager?")
-            show_manager_link()
-            # Reset flow after recommendation
-            st.session_state.flow = None
-            st.session_state.slots = {}
-            return
+    if intent == "membership":
+        membership_flow(user_text, kb); return
 
-    # Schedule dialog
-    if st.session_state.flow == "schedule" or re.search(r"\b(schedule|class|spin|barre|circuit|yoga|training)\b", user_text, re.I):
-        st.session_state.flow = "schedule"
-        day = parse_day(user_text) or st.session_state.slots.get("day")
-        timewin = parse_timewindow(user_text) or st.session_state.slots.get("timewin")
-        if not day:
-            st.chat_message("assistant").write("Okay — what **day** would you like to work out?")
-            st.session_state.slots["day"] = None
-            return
-        st.session_state.slots["day"] = day
-        if not timewin:
-            st.chat_message("assistant").write("Great — what **time** works? (morning / afternoon / evening or a time like 6:00am)")
-            st.session_state.slots["timewin"] = None
-            return
-        st.session_state.slots["timewin"] = timewin
+    if intent == "schedule":
+        schedule_flow(user_text, kb); return
 
-        kb = st.session_state.get("kb_obj")
-        q = f"classes on {day} {timewin}"
-        ans = answer_question(q)
-        if ans == UNKNOWN_MESSAGE:
-            ans = answer_question(f"{day} class schedule {timewin}")
-        if ans == UNKNOWN_MESSAGE:
-            st.chat_message("assistant").write(UNKNOWN_MESSAGE)
-            show_manager_link()
-        else:
-            # Render concise list-like answer
-            st.chat_message("assistant").write(ans)
-            st.chat_message("assistant").write("Want to speak with our manager to pick a class?")
-            show_manager_link()
-        # Reset flow
-        st.session_state.flow = None
-        st.session_state.slots = {}
-        return
-
-    # General Q&A
+    # general QA from KB with confidence threshold
     ans = answer_question(user_text)
-    st.chat_message("assistant").write(ans)
-    if ans == UNKNOWN_MESSAGE:
-        show_manager_link()
+    if ans:
+        st.chat_message("assistant").markdown(ans, unsafe_allow_html=True)
+    else:
+        _kb_not_ready_msg()
 
-    # Lead capture nudge on buying intent
-    if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition|consult)\b", user_text, re.I):
+    # lightweight lead capture nudge on intent-y keywords
+    if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition)\b", user_text, re.I):
         with st.expander("Leave your info for a follow-up (optional)"):
             with st.form(f"lead_{int(time.time())}"):
                 name  = st.text_input("Name")
                 email = st.text_input("Email")
                 phone = st.text_input("Phone (optional)")
-                submitted = st.form_submit_button("Send to team")
-                if submitted and name and email:
+                optin = st.checkbox("I agree to be contacted about my inquiry.")
+                submitted = st.form_submit_button("Send")
+                if submitted and name and email and optin:
                     try:
                         add_lead(name, email, phone, interest="From chat", source="web")
                         st.success("Thanks! We’ll follow up shortly.")
                     except Exception:
                         st.info("Saved locally. (Lead sheet not configured.)")
 
+# ---------------------- Replay + Input ----------------------
+for role, msg in ss.chat_history:
+    st.chat_message(role).write(msg)
 
-# ================================================================
-# Quick-reply chips
-# ================================================================
-def quick_chips():
-    st.markdown('<div class="z-chips">', unsafe_allow_html=True)
-    cols = st.columns(4)
-    chips = [
-        ("Membership prices", "How much is a membership?"),
-        ("What’s on today", "What classes are available today?"),
-        ("Childcare", "Do you offer childcare?"),
-        ("Speak to a person", "I want to speak with someone"),
-    ]
-    for i, (label, text) in enumerate(chips):
-        if cols[i].button(label, key=f"chip_{i}", use_container_width=True):
-            st.session_state.chat_history.append(("user", text))
-            st.session_state["__chip_sent"] = text
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ================================================================
-# Admin Panel (Top)
-# ================================================================
-if st.session_state.is_admin:
-    with st.expander("Admin · Load / replace knowledge base (PDF/Text) · Settings", expanded=False):
-        uploaded = st.file_uploader(
-            "Upload one or more PDFs (pricing, schedule, policies). Use text-based PDFs (not scans).",
-            type=["pdf"], accept_multiple_files=True
-        )
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            if st.button("Build/Replace knowledge base", type="primary", disabled=(not uploaded)):
-                with st.spinner("Indexing documents…"):
-                    kb = _build_index(
-                        from_files=[io.BytesIO(f.read()) for f in uploaded],
-                        filenames=[f.name for f in uploaded],
-                    )
-                    st.session_state.kb_obj = kb
-                    st.session_state.kb_ready = True
-                st.success(f"Indexed {len(kb.chunks)} chunks from {len(set(kb.sources))} file(s).")
-        with colB:
-            if st.button("Load existing index from disk"):
-                kb = cached_load_index()
-                if kb:
-                    st.session_state.kb_obj = kb
-                    st.session_state.kb_ready = True
-                    st.success(f"Loaded {len(kb.chunks)} chunks from disk.")
-                else:
-                    st.warning("No saved index found yet.")
-        with colC:
-            new_thr = st.number_input("Similarity threshold", min_value=0.05, max_value=0.50, step=0.01, value=float(MIN_SIMILARITY))
-            if st.button("Apply threshold"):
-                st.success(f"Using MIN_SIMILARITY={new_thr:.2f} (until app restarts)")
-                # store per-session (secrets are immutable at runtime)
-                st.session_state.MIN_SIMILARITY = float(new_thr)
-
-# Use session override if admin adjusted threshold
-if "MIN_SIMILARITY" in st.session_state:
-    MIN_SIMILARITY = float(st.session_state.MIN_SIMILARITY)
-
-# ================================================================
-# Top chips + Transcript + Input
-# ================================================================
-quick_chips()
-
-# Replay previous messages
-for role, msg in st.session_state.chat_history:
-    if role == "user":
-        st.chat_message("user").markdown(f"<div class='user-bubble'>{msg}</div>", unsafe_allow_html=True)
-    else:
-        st.chat_message("assistant").write(msg)
-
-# Handle chip click as a turn
-if st.session_state.get("__chip_sent"):
-    handle_turn(st.session_state.pop("__chip_sent"))
-
-# Normal input
 user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)") or ""
 if user_msg:
-    st.session_state.chat_history.append(("user", user_msg))
+    ss.chat_history.append(("user", user_msg))
     handle_turn(user_msg)
 
-# Footer watermark
-st.markdown('<div class="z-foot">Powered by ZARI</div>', unsafe_allow_html=True)
+# ---------------------- Footer ----------------------
+st.markdown(
+    '<div class="zari-footer small-note">Powered by <strong>ZARI</strong></div>',
+    unsafe_allow_html=True
+)
