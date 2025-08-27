@@ -1,87 +1,121 @@
-# app.py — SWT Fitness Customer Support (Pro UI, durable, guided flows)
-# - Guided flows for memberships, schedule, childcare, policy (follow-up first)
-# - Calendly handoff + SMS alternative + Feedback form
-# - RAG over uploaded PDFs (TF-IDF) with safe fallbacks
-# - Admin upload panel
+# app.py — SWT Fitness Customer Support (Pro UI)
+# - PDF/Text RAG (pypdf + TF-IDF) stored on /mount/data (Streamlit Cloud-safe)
+# - Admin upload & reindex
+# - Guided intents (membership, schedule) with follow-ups (no copy/paste walls)
+# - Human handoff via Calendly (slot buttons + fallback booking link)
+# - Optional lead capture to Google Sheets
+# - Feedback form link (secrets) and escalation to text/manager
 # - "Powered by ZARI" footer
-# - Cold-start safe (never touches KB if not loaded)
 
 from __future__ import annotations
 
-import io, os, json, re, time, textwrap, datetime as dt
+import io, os, re, json, time, textwrap, datetime as dt, tempfile
+from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Any, List, Tuple, Dict
 
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
-import pytz
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import joblib
+import pytz
 
-# ---------- Optional integrations ----------
+# ---------- Optional deps (safe stubs if modules missing) ----------
+try:
+    from intents import wants_handoff as _wants_handoff_external
+except Exception:
+    def _wants_handoff_external(t: str) -> bool:
+        return bool(re.search(r"\b(speak|talk|call|human|person|manager|someone)\b", t, re.I))
+
 try:
     from calendly_api import list_available_times, create_single_use_link
 except Exception:
-    def list_available_times(*a, **k): return []
-    def create_single_use_link(*a, **k): return None
+    def list_available_times(event_type_uri: str, start: dt.datetime, end: dt.datetime, tz: str) -> List[Dict]:
+        return []
+    def create_single_use_link(event_type_uri: str) -> str:
+        return ""
 
 try:
     from leads import add_lead
 except Exception:
-    def add_lead(*a, **k): raise RuntimeError("lead sheet not configured")
+    def add_lead(name: str, email: str, phone: str = "", interest: str = "", source: str = ""):
+        return
 
-# ================== CONFIG / SECRETS ==================
+# ---------- Page & secrets ----------
 st.set_page_config(page_title="SWT Fitness Customer Support", page_icon="💬", layout="wide")
 
-STUDIO_NAME     = st.secrets.get("STUDIO_NAME", "SWT Fitness")
-ADMIN_PASSWORD  = st.secrets.get("ADMIN_PASSWORD", "admin")
+STUDIO_NAME        = st.secrets.get("STUDIO_NAME", "SWT Fitness")
+ADMIN_PASSWORD     = st.secrets.get("ADMIN_PASSWORD", "admin")
+CALENDLY_EVENT_TYPE= st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
+CALENDLY_URL       = st.secrets.get("CALENDLY_URL", "").strip()
+CALENDLY_TZ        = st.secrets.get("CALENDLY_TZ", "America/New_York")
+FEEDBACK_FORM_URL  = st.secrets.get("FEEDBACK_FORM_URL", "").strip()  # optional
 
-# Calendly
-CALENDLY_EVENT_TYPE = st.secrets.get("CALENDLY_EVENT_TYPE", "").strip()
-CALENDLY_URL        = st.secrets.get("CALENDLY_URL", "").strip()
-CALENDLY_TZ         = st.secrets.get("CALENDLY_TZ", "America/New_York")
+# ---------- Storage paths (Streamlit Cloud-safe) ----------
+def _pick_writable_dir() -> Path:
+    candidates = [
+        Path(os.environ.get("DATA_DIR", "/mount/data")) / "swt_kb",
+        Path.cwd() / ".kb_cache",
+        Path(tempfile.gettempdir()) / "swt_kb",
+    ]
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            p = c / ".write_test"
+            p.write_text("ok")
+            p.unlink(missing_ok=True)
+            return c
+        except Exception:
+            continue
+    raise RuntimeError("No writable data directory available")
 
-# Contact options
-SWT_SMS_NUMBER     = "+1 (443) 975 - 9649"
+DATA_DIR  = _pick_writable_dir()
+VEC_PATH  = DATA_DIR / "kb_vectorizer.joblib"
+MAT_PATH  = DATA_DIR / "kb_matrix.joblib"
+META_PATH = DATA_DIR / "kb_meta.json"
 
-# Storage for KB files
-DATA_DIR  = "/mnt/data"
-VEC_PATH  = os.path.join(DATA_DIR, "kb_vectorizer.joblib")
-MAT_PATH  = os.path.join(DATA_DIR, "kb_matrix.joblib")
-META_PATH = os.path.join(DATA_DIR, "kb_meta.json")
+# ---------- Session ----------
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+if "kb_ready" not in st.session_state:
+    st.session_state.kb_ready = False
+if "show_sources" not in st.session_state:
+    st.session_state.show_sources = False
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # list[(role, text)]
+if "flow" not in st.session_state:
+    st.session_state.flow = {}          # state for guided intents
 
-# ================== SESSION DEFAULTS ==================
-ss = st.session_state
-ss.setdefault("is_admin", False)
-ss.setdefault("kb_ready", False)
-ss.setdefault("show_sources", True)
-ss.setdefault("chat_history", [])
-ss.setdefault("pending_intent", None)  # ("intent_name", payload)
+# ---------- Styles (Pro-ish look) ----------
+st.markdown("""
+<style>
+/* cleaner chat bubbles */
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p { margin: 0.2rem 0; }
+.stChatFloatingInputContainer { border-top: 1px solid #eee; }
+.badge { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; color:#666; }
+.slot-btn { display:inline-block; margin:6px 8px; padding:8px 12px; border-radius:10px; border:1px solid #ddd; text-decoration:none; }
+.footer { text-align:center; color:#888; font-size:12px; padding:8px 0 0 0; }
+.brand { font-weight:600; color:#0f766e; }
+</style>
+""", unsafe_allow_html=True)
 
-# ================== SAFE FALLBACK DATA ==================
-DEFAULT_MEMBERSHIPS = {
-    "Sapphire": {"price": "59.99", "classes_per_week": "2", "childcare": "84.99"},
-    "Pearl":    {"price": "79.99", "classes_per_week": "3", "childcare": "104.99"},
-    "Diamond":  {"price": "95.99", "classes_per_week": "Unlimited", "childcare": "120.99"},
-}
-
-# ================== KB HELPERS ==================
+# ---------- KB structures ----------
 @dataclass
 class KB:
     vectorizer: TfidfVectorizer
-    matrix: Any
+    matrix: Any  # sparse
     chunks: List[str]
     sources: List[str]
 
-def _chunk(text: str, size: int = 500, overlap: int = 120) -> List[str]:
+def _chunk(text: str, chunk_size: int = 500, overlap: int = 120) -> List[str]:
     words = text.split()
+    if not words: return []
     out, i = [], 0
     while i < len(words):
-        out.append(" ".join(words[i:i+size]))
-        i += max(1, size - overlap)
+        out.append(" ".join(words[i:i+chunk_size]))
+        i += max(1, chunk_size - overlap)
     return out
 
 def _read_pdf(file: io.BytesIO) -> str:
@@ -92,42 +126,33 @@ def _read_pdf(file: io.BytesIO) -> str:
         if t: parts.append(t)
     return "\n".join(parts)
 
-def _build_index(files: List[io.BytesIO], names: List[str]) -> KB:
-    chunks, sources = [], []
-    for f, nm in zip(files, names):
+def _build_index(from_files: List[io.BytesIO], filenames: List[str]) -> KB:
+    all_chunks, sources = [], []
+    for f, name in zip(from_files, filenames):
         f.seek(0)
         txt = _read_pdf(f)
-        for ch in _chunk(txt):
-            chunks.append(ch); sources.append(nm)
-    vec = TfidfVectorizer(ngram_range=(1,2), max_features=50000, lowercase=True)
-    mat = vec.fit_transform(chunks)
+        for ch in _chunk(txt, 500, 120):
+            all_chunks.append(ch)
+            sources.append(name)
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    joblib.dump(vec, VEC_PATH)
-    joblib.dump(mat, MAT_PATH)
-    with open(META_PATH, "w") as fh:
-        json.dump({"chunks": chunks, "sources": sources}, fh)
-    return KB(vec, mat, chunks, sources)
+    vectorizer = TfidfVectorizer(ngram_range=(1,2), max_features=50000, lowercase=True)
+    matrix = vectorizer.fit_transform(all_chunks)
 
-def _load_index_if_exists() -> Optional[KB]:
+    joblib.dump(vectorizer, VEC_PATH)
+    joblib.dump(matrix, MAT_PATH)
+    META_PATH.write_text(json.dumps({"chunks": all_chunks, "sources": sources}))
+    return KB(vectorizer, matrix, all_chunks, sources)
+
+def _load_index_if_exists() -> KB | None:
     try:
-        if not (os.path.exists(VEC_PATH) and os.path.exists(MAT_PATH) and os.path.exists(META_PATH)):
+        if not (VEC_PATH.exists() and MAT_PATH.exists() and META_PATH.exists()):
             return None
-        vec  = joblib.load(VEC_PATH)
-        mat  = joblib.load(MAT_PATH)
-        meta = json.load(open(META_PATH))
-        return KB(vec, mat, meta["chunks"], meta["sources"])
+        vectorizer = joblib.load(VEC_PATH)
+        matrix = joblib.load(MAT_PATH)
+        meta = json.loads(META_PATH.read_text())
+        return KB(vectorizer, matrix, meta["chunks"], meta["sources"])
     except Exception:
         return None
-
-def _get_kb() -> Optional[KB]:
-    kb = ss.get("kb_obj")
-    if kb: return kb
-    kb = _load_index_if_exists()
-    if kb:
-        ss.kb_obj = kb
-        ss.kb_ready = True
-    return kb
 
 def _retrieve(kb: KB, query: str, k: int = 4) -> List[Tuple[str, str, float]]:
     qv = kb.vectorizer.transform([query])
@@ -135,359 +160,336 @@ def _retrieve(kb: KB, query: str, k: int = 4) -> List[Tuple[str, str, float]]:
     idx = np.argsort(-sims)[:k]
     return [(kb.chunks[i], kb.sources[i], float(sims[i])) for i in idx]
 
-def _compose_answer(question: str, hits: List[Tuple[str, str, float]]) -> str:
-    if not hits:
-        return "I don't know. Would you like to speak with our manager?"
-    context = "\n\n".join([h[0] for h in hits])
+def _summarize_snippets(question: str, hits: List[Tuple[str, str, float]]) -> str:
+    if not hits: 
+        return ""
+    text = "\n\n".join(h[0] for h in hits)
+    # Try to extract concise facts (prices, times, days, emails, address)
+    bullets = []
+
+    # prices
+    prices = re.findall(r"\$ ?\d+(?:\.\d{2})?", text)
+    if prices:
+        bullets.append("Pricing mentioned: " + ", ".join(sorted(set(prices))[:4]))
+
+    # days/classes
+    days = re.findall(r"\b(Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\b", text, re.I)
+    if days:
+        bullets.append("Days referenced: " + ", ".join(sorted(set(d.title() for d in days))))
+
+    # childcare/policy keywords
+    if re.search(r"child\s*care|childcare", text, re.I):
+        bullets.append("Childcare available (details in policy).")
+    if re.search(r"cancel|freeze|late|policy|terms", text, re.I):
+        bullets.append("See policies for freeze/cancel/late rules.")
+
+    # fallback: first couple of short sentences matching keywords
     kws = [w for w in re.findall(r"[A-Za-z0-9]+", question.lower()) if len(w) > 3]
-    sentences = re.split(r"(?<=[.!?])\s+", context)
-    picked = []
-    for s in sentences:
-        ls = s.lower()
-        if any(k in ls for k in kws) or len(picked) < 3:
-            picked.append(s.strip())
-        if len(" ".join(picked)) > 700: break
-    ans = " ".join(picked).strip() or (sentences[0].strip() if sentences else "")
-    return textwrap.shorten(ans, width=800, placeholder="…")
+    if kws:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        picked = []
+        for s in sentences:
+            if any(k in s.lower() for k in kws):
+                s = s.strip()
+                if 15 <= len(s) <= 180:
+                    picked.append(s)
+            if len(picked) >= 3: break
+        if picked:
+            bullets.extend(picked)
 
-def answer_from_kb(question: str) -> str:
-    kb = _get_kb()
+    if not bullets:
+        return ""
+    return " • " + "\n • ".join(bullets)
+
+def _answer_from_kb(question: str, min_sim: float = 0.15) -> str | None:
+    kb: KB | None = st.session_state.get("kb_obj")
     if not kb:
-        return "I don't know. Would you like to speak with our manager?"
+        kb = _load_index_if_exists()
+        if kb:
+            st.session_state.kb_obj = kb
+            st.session_state.kb_ready = True
+    if not kb:
+        return None
     hits = _retrieve(kb, question, k=4)
-    ans = _compose_answer(question, hits)
-    if ss.show_sources and hits:
-        uniq = []
+    if not hits or max(h[2] for h in hits) < min_sim:
+        return None
+    summary = _summarize_snippets(question, hits) or ""
+    if st.session_state.show_sources and hits:
+        seen = []
         for _, s, _ in hits:
-            if s not in uniq: uniq.append(s)
-        ans += "\n\n_sources: " + ", ".join(uniq[:4])
-    return ans
+            if s not in seen: seen.append(s)
+        summary += ("\n\n" if summary else "") + "_sources: " + ", ".join(seen[:4])
+    return summary or None
 
-# ================== LIGHT PARSERS ==================
-def _full_text(kb: KB) -> str:
-    return "\n".join(kb.chunks)
+# ---------- Intents ----------
+def wants_handoff(t: str) -> bool:
+    return _wants_handoff_external(t)
 
-def extract_memberships(kb: Optional[KB]) -> Dict[str, Dict[str, str]]:
-    if not kb: return {}
-    t = re.sub(r"\s+", " ", _full_text(kb))
-    out: Dict[str, Dict[str, str]] = {}
-    tiers = {"Sapphire":["Sapphire","Saphire"], "Pearl":["Pearl"], "Diamond":["Diamond","Diamonds"]}
-    for tier, keys in tiers.items():
-        m = re.search(rf"(?i)({'|'.join(keys)})[^$]{{0,40}}\$?\s?([0-9]+(?:\.[0-9]{{2}})?)", t)
-        if m: out[tier] = {"price": m.group(2)}
-        m2 = re.search(rf"(?i){tier}[^$]{{0,80}}\$?\s?([0-9]+(?:\.[0-9]{{2}})?)\s*(with|w/)\s*child\s*care", t)
-        if m2: out.setdefault(tier, {})["childcare"] = m2.group(1)
-    return out
+def detect_intent(t: str) -> str | None:
+    t = t.lower()
+    if re.search(r"\b(member(ship)?|join|price|cost|plan|tier)\b", t): return "membership"
+    if re.search(r"\b(class|schedule|time|what.*today|when.*class)\b", t): return "schedule"
+    if wants_handoff(t): return "handoff"
+    return None
 
-def extract_policy_snippet(kb: Optional[KB], topic: str) -> Optional[str]:
-    if not kb: return None
-    t = _full_text(kb)
-    # naive window around keywords
-    key = {"cancel":"cancel", "freeze":"freeze", "late":"late cancel"}.get(topic, topic)
-    m = re.search(rf"(?is).{{0,240}}{re.escape(key)}.{{0,240}}", t)
-    if not m: return None
-    s = re.sub(r"\s+", " ", m.group(0)).strip()
-    return textwrap.shorten(s, 500, placeholder="…")
-
-# ================== INTENTS ==================
-_MEMBERSHIP_WORDS = r"(member|plan|price|cost|join)"
-_SCHEDULE_WORDS   = r"(class|schedule|when|time|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
-_CHILDCARE_WORDS  = r"(child\s*care|childcare|kids? club|babysit)"
-_POLICY_WORDS     = r"(policy|cancel|freeze|late\s*cancel|terms|rules)"
-_HANDOFF_WORDS    = r"(human|person|manager|call|book|meeting|talk|speak)"
-
-def detect_intent(msg: str) -> str:
-    m = msg.lower()
-    if re.search(_HANDOFF_WORDS, m):   return "handoff"
-    if re.search(_MEMBERSHIP_WORDS, m):return "membership"
-    if re.search(_CHILDCARE_WORDS, m): return "childcare"
-    if re.search(_POLICY_WORDS, m):    return "policy"
-    if re.search(_SCHEDULE_WORDS, m):  return "schedule"
-    return "kb"
-
-# ================== COMMON CONTACT OPTIONS ==================
-def show_contact_options():
-    st.chat_message("assistant").write(
-        f"If you’d prefer texting, send us a message at **{SWT_SMS_NUMBER}** and we’ll reply within ~30 minutes."
-    )
-    with st.expander("Complaint / Feedback (opens a short form)"):
-        with st.form(f"fb_{int(time.time())}"):
-            name  = st.text_input("Name")
-            email = st.text_input("Email")
-            phone = st.text_input("Phone (optional)")
-            issue = st.text_area("Describe your complaint or feedback")
-            ok    = st.checkbox("I agree to be contacted about my submission.")
-            submitted = st.form_submit_button("Submit")
-            if submitted and name and email and issue and ok:
-                try:
-                    add_lead(name, email, phone, interest=f"Feedback: {issue[:80]}", source="feedback")
-                    st.success("Thanks! We received your feedback and will follow up.")
-                except Exception:
-                    st.info("Saved locally. (Feedback sheet not configured.)")
-
-    st.chat_message("assistant").write("Would you like to pick a time with our manager?")
-    show_manager_slots()
-
-# ================== FLOWS ==================
-def membership_flow():
-    kb = _get_kb()
-    mm = extract_memberships(kb) or DEFAULT_MEMBERSHIPS
-    try:
-        prices = [float(v["price"]) for v in mm.values() if "price" in v]
-        lo, hi = min(prices), max(prices)
-        pr = f"${lo:.2f}–${hi:.2f}"
-    except Exception:
-        pr = "multiple price points"
-    st.chat_message("assistant").write(
-        f"Our memberships range from {pr}. **How many days per week** do you want to come (2, 3, or Unlimited)?"
-    )
-    ss.pending_intent = ("membership_followup", mm)
-
-def membership_followup(user_text: str, mm: Dict[str, Dict[str, str]]):
-    choice = user_text.strip().lower()
-    tier = None
-    if re.search(r"\b2\b|two", choice): tier = "Sapphire" if "Sapphire" in mm else None
-    elif re.search(r"\b3\b|three", choice): tier = "Pearl" if "Pearl" in mm else None
-    elif re.search(r"unlimited|any|whenever", choice): tier = "Diamond" if "Diamond" in mm else None
-    if not tier:
-        st.chat_message("assistant").write("I’m not sure which plan that is. Would you like to speak with our manager?")
-        show_contact_options()
-        return
-    info  = mm[tier]
-    price = info.get("price", "—")
-    cc    = info.get("childcare")
-    cc_txt = f" (with childcare: ${cc})" if cc else ""
-    st.chat_message("assistant").write(
-        f"I’d recommend **{tier}** at **${price}**/mo{cc_txt}. Do you want to see class options next?"
-    )
-    # After a recommendation, present contact choices
-    show_contact_options()
-
-def schedule_flow():
-    st.chat_message("assistant").write("**What day** would you like to work out?")
-    ss.pending_intent = ("schedule_day", None)
-
-def schedule_day_followup(day_text: str):
-    day = day_text.strip()
-    st.chat_message("assistant").write("Great — **what time** works best (morning, lunchtime, evening)?")
-    ss.pending_intent = ("schedule_time", day)
-
-def schedule_time_followup(time_text: str, day: str):
-    pref = time_text.strip().lower()
-    kb = _get_kb()
-    if kb:
-        try:
-            q = f"{day} {pref} class schedule"
-            ans = answer_from_kb(q)
-            if "I don't know" not in ans:
-                st.chat_message("assistant").write(ans)
-            else:
-                st.chat_message("assistant").write("I’m not sure. Would you like to speak with our manager?")
-                show_contact_options()
-                return
-        except Exception:
-            st.chat_message("assistant").write("I’m not sure. Would you like to speak with our manager?")
-            show_contact_options()
-            return
-    else:
-        st.chat_message("assistant").write("Our detailed schedule isn’t loaded yet. Would you like to speak with our manager?")
-    show_contact_options()
-
-def childcare_flow():
-    st.chat_message("assistant").write("For childcare, **what time of day** do you prefer, and the **child’s age**?")
-    ss.pending_intent = ("childcare_followup", None)
-
-def childcare_followup(user_text: str):
-    kb = _get_kb()
-    if kb:
-        q = f"childcare availability {user_text}"
-        ans = answer_from_kb(q)
-        st.chat_message("assistant").write(ans)
-    else:
-        st.chat_message("assistant").write(
-            "Childcare details vary by time and age. I can confirm availability for you."
-        )
-    show_contact_options()
-
-def policy_flow():
-    st.chat_message("assistant").write(
-        "Which policy do you need? **Cancel**, **Freeze**, or **Late Cancel**?"
-    )
-    ss.pending_intent = ("policy_followup", None)
-
-def policy_followup(user_text: str):
-    kb = _get_kb()
-    topic = "cancel" if "cancel" in user_text.lower() and "late" not in user_text.lower() else \
-            "freeze" if "freeze" in user_text.lower() else \
-            "late"
-    snippet = extract_policy_snippet(kb, topic)
-    if snippet:
-        st.chat_message("assistant").write(snippet)
-    else:
-        st.chat_message("assistant").write("I don’t know. Would you like to speak with our manager?")
-    show_contact_options()
-
-def handoff_flow():
-    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
-    show_manager_slots()
-
-# ================== CALENDLY ==================
+# ---------- Calendly UI ----------
 def show_manager_slots():
+    st.chat_message("assistant").write("Absolutely — pick a time that works best for you:")
     tz = pytz.timezone(CALENDLY_TZ)
     now = dt.datetime.now(tz)
     start, end = now, now + dt.timedelta(days=7)
 
-    if not CALENDLY_EVENT_TYPE:
-        if CALENDLY_URL:
-            st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>',
-                     unsafe_allow_html=True)
-        else:
-            st.info("Scheduler temporarily unavailable.")
-        return
-
-    try:
-        slots = list_available_times(CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
-    except Exception:
-        st.error("Scheduler temporarily unavailable.")
-        if CALENDLY_URL:
-            st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>',
-                     unsafe_allow_html=True)
-        return
-
-    if not slots:
-        st.info("No open slots in the next 7 days.")
+    if CALENDLY_EVENT_TYPE:
         try:
-            url = create_single_use_link(CALENDLY_EVENT_TYPE)
-            if url:
-                st.write(f'<a href="{url}" target="_blank" rel="noopener">See more dates</a>', unsafe_allow_html=True)
+            slots = list_available_times(CALENDLY_EVENT_TYPE, start, end, CALENDLY_TZ)
         except Exception:
-            pass
-        if CALENDLY_URL:
-            st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>',
-                     unsafe_allow_html=True)
+            slots = []
+        if slots:
+            from collections import defaultdict
+            by_day = defaultdict(list)
+            for s in slots:
+                t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
+                by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
+            for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
+                with st.expander(day, expanded=len(by_day) == 1):
+                    for t, url in entries:
+                        label = t.strftime("%-I:%M %p")
+                        st.write(f'<a class="slot-btn" href="{url}" target="_blank" rel="noopener">Book {label}</a>', unsafe_allow_html=True)
+            return
+    # fallback
+    if CALENDLY_URL:
+        st.write(f'<a href="{CALENDLY_URL}" target="_blank" rel="noopener">Open booking page</a>', unsafe_allow_html=True)
+    else:
+        st.warning("Scheduler temporarily unavailable. Add CALENDLY_EVENT_TYPE or CALENDLY_URL in secrets.")
+
+# ---------- Guided flows ----------
+def start_membership_flow():
+    st.session_state.flow = {"name": "membership", "stage": "freq"}
+    st.chat_message("assistant").write(
+        "Our monthly plans range by visit frequency and childcare.\n\n"
+        "How often do you plan to come each week?",
+    )
+    st.chat_message("assistant").write("Choose one:")
+    c1, c2, c3 = st.columns(3)
+    with c1: st.button("~2x / week", key=f"m2", on_click=lambda: _set_flow_choice("~2"))
+    with c2: st.button("~3x / week", key=f"m3", on_click=lambda: _set_flow_choice("~3"))
+    with c3: st.button("Unlimited", key=f"mu", on_click=lambda: _set_flow_choice("unlimited"))
+
+def _set_flow_choice(val: str):
+    st.session_state.flow["choice"] = val
+    st.session_state.flow["stage"] = "childcare"
+
+def continue_membership_flow(user_text: str = ""):
+    flow = st.session_state.flow
+    if flow.get("stage") == "freq" and user_text:
+        # accept natural answers too
+        if re.search(r"unlimit|every|daily|any", user_text, re.I): _set_flow_choice("unlimited")
+        elif re.search(r"3|three", user_text): _set_flow_choice("~3")
+        else: _set_flow_choice("~2")
+
+    if flow.get("stage") == "childcare":
+        st.chat_message("assistant").write("Do you need childcare included?")
+        c1, c2 = st.columns(2)
+        with c1: st.button("Yes, include childcare", key="cc_yes", on_click=lambda: _finish_membership(True))
+        with c2: st.button("No childcare", key="cc_no", on_click=lambda: _finish_membership(False))
         return
 
-    from collections import defaultdict
-    by_day = defaultdict(list)
-    for s in slots:
-        t = dt.datetime.fromisoformat(s["start_time"].replace("Z", "+00:00")).astimezone(tz)
-        by_day[t.strftime("%A %b %d")].append((t, s["scheduling_url"]))
+def _finish_membership(with_childcare: bool):
+    choice = st.session_state.flow.get("choice", "~2")
+    # Pull concise price hints from KB if possible
+    kb_hint = _answer_from_kb("membership pricing childcare") or ""
+    dollars = re.findall(r"\$ ?\d+(?:\.\d{2})?", kb_hint)
+    price_hint = ""
+    if dollars:
+        uniq = sorted(set(dollars), key=lambda x: float(re.sub(r"[^\d.]", "", x)))
+        if len(uniq) >= 2:
+            price_hint = f"Prices typically range {uniq[0]}–{uniq[-1]}."
+        else:
+            price_hint = f"Typical price: {uniq[0]}."
+    # Recommend
+    if choice == "~2":
+        rec = "Our **Sapphire**-style plan (about 2 classes/week)"
+    elif choice == "~3":
+        rec = "Our **Pearl**-style plan (about 3 classes/week)"
+    else:
+        rec = "Our **Diamond**-style plan (unlimited classes)"
 
-    for day, entries in sorted(by_day.items(), key=lambda kv: kv[1][0][0]):
-        with st.expander(day, expanded=len(by_day) == 1):
-            for t, url in entries:
-                label = t.strftime("%-I:%M %p")
-                st.write(
-                    f'<a href="{url}" target="_blank" rel="noopener" '
-                    f'style="display:inline-block;margin:6px 8px;padding:8px 12px;'
-                    f'border-radius:10px;border:1px solid #ddd;text-decoration:none;">'
-                    f'Book {label}</a>',
-                    unsafe_allow_html=True,
-                )
+    cc = " with **childcare add-on**" if with_childcare else ""
+    msg = f"{rec}{cc} is usually the best fit. {price_hint or ''}".strip()
 
-# ================== UI / THEME ==================
-def _inject_css():
-    st.markdown("""
-    <style>
-      section.main > div { padding-top: 10px; }
-      .stChatMessage { padding: 10px 14px; border-radius: 14px; margin: 8px 0; }
-      .stChatMessage[data-testid="stChatMessageUser"] {
-          background: #ffffff; border:1px solid #e8e8e8;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-      }
-      .stChatMessage[data-testid="stChatMessageAssistant"] {
-          background: #f7f9fc; border:1px solid #e6eef9;
-      }
-      .zari { text-align:center; font-size: 12.5px; color:#667085; margin-top: 8px;}
-      .zari strong { color:#2e3aef; }
-      [data-testid="stHeader"] { background-color: transparent; }
-    </style>
-    """, unsafe_allow_html=True)
+    st.chat_message("assistant").markdown(msg)
+    st.chat_message("assistant").markdown(
+        "Would you like to:\n\n"
+        "• **See available times** to talk to our manager?\n"
+        "• **Leave your info** and we’ll follow up?\n"
+        "• Or keep asking questions."
+    )
+    st.session_state.flow = {}
 
-# ================== SIDEBAR ==================
+def start_schedule_flow():
+    st.session_state.flow = {"name": "schedule", "stage": "day"}
+    st.chat_message("assistant").write("Great! What day do you want to work out? (e.g., Monday)")
+
+def continue_schedule_flow(user_text: str):
+    flow = st.session_state.flow
+    if flow.get("stage") == "day":
+        m = re.search(r"(mon|tue|wed|thu|fri|sat|sun)[a-z]*", user_text, re.I)
+        if not m:
+            st.chat_message("assistant").write("Please tell me a day (e.g., Monday).")
+            return
+        flow["day"] = m.group(0).title()
+        flow["stage"] = "time"
+        st.chat_message("assistant").write(f"Awesome — what time window on {flow['day']}? (e.g., 6–10am or 5–8pm)")
+        return
+    if flow.get("stage") == "time":
+        # Try to extract hour(s)
+        flow["time"] = user_text.strip()
+        # Query KB for that day
+        kb_ans = _answer_from_kb(f"{flow['day']} class schedule") or _answer_from_kb("class schedule")
+        if not kb_ans:
+            st.chat_message("assistant").write("I’m not sure. Would you like to speak with our manager?")
+        else:
+            # Pull lines containing that day
+            lines = [ln for ln in kb_ans.splitlines() if flow["day"] in ln or re.search(r"\d", ln)]
+            pretty = "\n".join("- " + ln.strip("•- ") for ln in lines[:8]) or kb_ans
+            st.chat_message("assistant").markdown(f"Here’s what’s happening on **{flow['day']}** around **{flow['time']}**:\n\n{pretty}")
+            st.chat_message("assistant").markdown("Need a different day or time? Ask away, or I can connect you with a person.")
+        st.session_state.flow = {}
+
+# ---------- Main handlers ----------
+def handle_user_turn(user_text: str):
+    st.chat_message("user").write(user_text)
+
+    # Continue an active flow
+    if st.session_state.flow.get("name") == "membership":
+        continue_membership_flow(user_text)
+        return
+    if st.session_state.flow.get("name") == "schedule":
+        continue_schedule_flow(user_text)
+        return
+
+    # Detect new intent
+    intent = detect_intent(user_text)
+    if intent == "handoff":
+        show_manager_slots()
+        return
+    if intent == "membership":
+        start_membership_flow()
+        return
+    if intent == "schedule":
+        start_schedule_flow()
+        return
+
+    # Try KB
+    ans = _answer_from_kb(user_text)
+    if ans:
+        st.chat_message("assistant").markdown(ans)
+        _maybe_offer_lead_capture(user_text)
+        return
+
+    # Unknown → escalate
+    st.chat_message("assistant").write(
+        "I’m not sure. Would you like to speak with our manager?"
+    )
+    show_manager_slots()
+    _show_text_and_feedback_options()
+
+def _maybe_offer_lead_capture(user_text: str):
+    if re.search(r"\b(trial|join|sign\s*up|membership|personal training|nutrition)\b", user_text, re.I):
+        with st.expander("Leave your info for a follow-up (optional)"):
+            with st.form(f"lead_{int(time.time())}"):
+                name  = st.text_input("Name")
+                email = st.text_input("Email")
+                phone = st.text_input("Phone (optional)")
+                ok = st.checkbox("I agree to be contacted about my inquiry.")
+                submitted = st.form_submit_button("Send")
+                if submitted and name and email and ok:
+                    try:
+                        add_lead(name, email, phone, interest="From chat", source="web")
+                        st.success("Thanks! We’ll follow up shortly.")
+                    except Exception:
+                        st.info("Saved locally. (Lead sheet not configured.)")
+
+def _show_text_and_feedback_options():
+    st.info("Prefer to text? Get a reply within ~30 minutes: **+1 (443) 975-9649**.")
+    if FEEDBACK_FORM_URL:
+        st.write(f'[Report a complaint / feedback / app issue]({FEEDBACK_FORM_URL})')
+
+# ---------- Sidebar / Header ----------
 with st.sidebar:
-    st.toggle("Show sources", value=ss.show_sources, key="show_sources")
-    st.caption("Runs on Streamlit free tier. PDF/Text search only (no paid APIs).")
+    st.toggle("Show sources", value=st.session_state.show_sources, key="show_sources")
+    st.caption(f"KB cache: {DATA_DIR}")
     st.markdown("---")
-    if not ss.is_admin:
+    if not st.session_state.is_admin:
         with st.popover("Admin mode"):
-            pw = st.text_input("Password", type="password")
-            if st.button("Log in"):
+            pw = st.text_input("Password", type="password", key="pw1")
+            if st.button("Log in", key="login1"):
                 if pw == ADMIN_PASSWORD:
-                    ss.is_admin = True; st.success("Admin mode enabled.")
+                    st.session_state.is_admin = True
+                    st.success("Admin mode enabled.")
                 else:
                     st.error("Wrong password.")
     else:
         st.success("Admin mode")
-        if st.button("Log out"): ss.is_admin = False
+        if st.button("Log out", key="logout1"):
+            st.session_state.is_admin = False
 
-# ================== HEADER ==================
-_inject_css()
+# Top bar admin toggle (quick)
+top_cols = st.columns([1,1,2,2,2])
+with top_cols[0]:
+    if st.toggle("Admin", value=st.session_state.is_admin, key="admin_toggle"):
+        if not st.session_state.is_admin:
+            pw = st.text_input("Admin password", type="password", key="pw_top")
+            if pw == ADMIN_PASSWORD:
+                st.session_state.is_admin = True
+                st.rerun()
+        else:
+            pass
+
+# ---------- Header ----------
 st.title(f"{STUDIO_NAME} Customer Support")
-st.caption("Ask about classes, schedules, childcare, pricing, policies, and more.")
+st.caption("Ask about classes, schedules, childcare, pricing, promotions, and more.")
 
-# Helpful notice if KB not loaded yet
-if not _get_kb():
-    st.info("Heads up: Knowledge Base isn’t loaded yet. Admins can upload PDFs in the sidebar. The bot still answers basic membership questions.")
-
-# ================== ADMIN PANEL ==================
-if ss.is_admin:
+# ---------- Admin panel ----------
+if st.session_state.is_admin:
     st.subheader("Admin · Load / replace knowledge base (PDF/Text)")
-    up = st.file_uploader("Upload one or more PDFs (pricing, policies, schedule).", type=["pdf"], accept_multiple_files=True)
-    c1, c2 = st.columns([1,1])
+    uploaded = st.file_uploader(
+        "Upload one or more PDFs (membership pricing, policies, schedule, childcare).",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    c1, c2 = st.columns(2)
     with c1:
-        if st.button("Build/Replace knowledge base", type="primary", use_container_width=True, disabled=(not up)):
+        disabled = not uploaded
+        if st.button("Build/Replace knowledge base", type="primary", use_container_width=True, disabled=disabled):
             with st.spinner("Indexing documents…"):
-                kb = _build_index([io.BytesIO(f.read()) for f in up], [f.name for f in up])
-                ss.kb_obj = kb; ss.kb_ready = True
+                kb = _build_index(
+                    [io.BytesIO(f.read()) for f in uploaded],
+                    [f.name for f in uploaded],
+                )
+                st.session_state.kb_obj = kb
+                st.session_state.kb_ready = True
             st.success(f"Indexed {len(kb.chunks)} chunks from {len(set(kb.sources))} file(s).")
     with c2:
         if st.button("Load existing index from disk", use_container_width=True):
             kb = _load_index_if_exists()
             if kb:
-                ss.kb_obj = kb; ss.kb_ready = True
+                st.session_state.kb_obj = kb
+                st.session_state.kb_ready = True
                 st.success(f"Loaded {len(kb.chunks)} chunks from disk.")
             else:
                 st.warning("No saved index found yet.")
     st.markdown("---")
 
-# ================== TURN HANDLER ==================
-def handle_turn(user_text: str):
-    if not user_text: return
-    st.chat_message("user").write(user_text)
+# ---------- Replay chat history ----------
+for role, msg in st.session_state.chat_history:
+    st.chat_message(role).markdown(msg)
 
-    # Handle ongoing multi-turn step first
-    if ss.pending_intent:
-        intent, payload = ss.pending_intent
-        ss.pending_intent = None
-        if intent == "membership_followup": membership_followup(user_text, payload); return
-        if intent == "schedule_day":        schedule_day_followup(user_text); return
-        if intent == "schedule_time":       schedule_time_followup(user_text, payload); return
-        if intent == "childcare_followup":  childcare_followup(user_text); return
-        if intent == "policy_followup":     policy_followup(user_text); return
-
-    # New turn → detect intent
-    intent = detect_intent(user_text)
-    if intent == "handoff":    handoff_flow(); return
-    if intent == "membership": membership_flow(); return
-    if intent == "schedule":   schedule_flow(); return
-    if intent == "childcare":  childcare_flow(); return
-    if intent == "policy":     policy_flow(); return
-
-    # KB fallback
-    ans = answer_from_kb(user_text)
-    st.chat_message("assistant").write(ans)
-    if "I don't know" in ans:
-        show_contact_options()
-
-# ================== CHAT LOOP ==================
-for role, msg in ss.chat_history:
-    st.chat_message(role).write(msg)
-
-user_msg = st.chat_input("Type your question (schedule, memberships, childcare, policies, etc.)") or ""
+# ---------- Chat input ----------
+user_msg = st.chat_input("Type your question (schedule, memberships, childcare, etc.)") or ""
 if user_msg:
-    ss.chat_history.append(("user", user_msg))
-    handle_turn(user_msg)
+    st.session_state.chat_history.append(("user", user_msg))
+    handle_user_turn(user_msg)
 
-# ================== FOOTER ==================
-st.markdown('<div class="zari">Powered by <strong>ZARI</strong></div>', unsafe_allow_html=True)
+# ---------- Footer ----------
+st.markdown('<div class="footer">Powered by <span class="brand">ZARI</span></div>', unsafe_allow_html=True)
